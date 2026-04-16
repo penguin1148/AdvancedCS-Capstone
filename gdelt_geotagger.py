@@ -13,7 +13,9 @@ import argparse
 import csv
 import curses
 import json
+import os
 import sys
+import tempfile
 import textwrap
 import time
 import urllib.error
@@ -27,13 +29,35 @@ from typing import Callable
 GDELT_DOC_URL = "https://api.gdeltproject.org/api/v2/doc/doc"
 
 # GDELT asks callers to stay under roughly one request every ~5 seconds; exceed
-# that and the edge starts returning 429 Too Many Requests. We enforce the
-# floor locally (no matter how often ``fetch_stories`` is called) and, when a
-# 429 slips through anyway, back off exponentially before retrying.
-MIN_REQUEST_INTERVAL = 5.0      # seconds between successive requests
-MAX_RETRIES = 4                 # total attempts on 429 / transient errors
-INITIAL_BACKOFF = 5.0           # first sleep on 429; doubles each retry
-_last_request_at: float = 0.0   # monotonic timestamp of the previous call
+# that and the edge starts returning 429 Too Many Requests, sometimes for
+# minutes at a time. We enforce the floor locally (no matter how often
+# ``fetch_stories`` is called, or how often the script is re-invoked) and,
+# when a 429 slips through anyway, back off exponentially before retrying.
+MIN_REQUEST_INTERVAL = 6.0      # seconds between successive requests
+MAX_RETRIES = 6                 # total attempts on 429 / transient errors
+INITIAL_BACKOFF = 15.0          # first sleep on 429; doubles each retry
+MAX_BACKOFF = 120.0             # cap any single backoff at 2 minutes
+
+# Persist the last-request timestamp so consecutive invocations of the script
+# still honor the rate limit. Stored as seconds-since-epoch in a small file
+# under the user's temp directory.
+_STATE_PATH = os.path.join(tempfile.gettempdir(), "gdelt_geotagger.state")
+
+
+def _load_last_request_time() -> float:
+    try:
+        with open(_STATE_PATH, "r", encoding="utf-8") as fh:
+            return float(fh.read().strip())
+    except (OSError, ValueError):
+        return 0.0
+
+
+def _save_last_request_time(ts: float) -> None:
+    try:
+        with open(_STATE_PATH, "w", encoding="utf-8") as fh:
+            fh.write(str(ts))
+    except OSError:
+        pass  # best-effort; a failure here just means no cross-run throttling
 
 # FIPS 10-4 country codes used by GDELT -> human-readable name.
 # Covers the codes most commonly seen in GDELT output. Anything missing
@@ -132,11 +156,24 @@ def _sleep_with_progress(seconds: float,
         remaining -= step
 
 
+def _parse_retry_after(header: str | None) -> float:
+    """Convert a ``Retry-After`` header to a wait duration in seconds.
+
+    The spec allows either a delta-seconds integer or an HTTP-date. We only
+    try the integer form; anything else falls through to our own backoff.
+    """
+    if not header:
+        return 0.0
+    try:
+        return max(0.0, float(header.strip()))
+    except ValueError:
+        return 0.0
+
+
 def _throttled_get(url: str, timeout: float,
                    on_wait: Callable[[str], None] | None) -> bytes:
-    """Fetch ``url`` while honoring the module-level request interval and
+    """Fetch ``url`` while honoring the cross-run request interval and
     retrying on 429 / transient 5xx responses with exponential backoff."""
-    global _last_request_at
 
     req = urllib.request.Request(
         url, headers={"User-Agent": "gdelt-geotagger/1.0"}
@@ -145,12 +182,16 @@ def _throttled_get(url: str, timeout: float,
     last_exc: Exception | None = None
 
     for attempt in range(1, MAX_RETRIES + 1):
-        # Client-side floor: keep at least MIN_REQUEST_INTERVAL between calls.
-        wait = MIN_REQUEST_INTERVAL - (time.monotonic() - _last_request_at)
+        # Client-side floor: keep at least MIN_REQUEST_INTERVAL between calls
+        # even across separate script invocations (state is persisted to disk).
+        last_ts = _load_last_request_time()
+        wait = MIN_REQUEST_INTERVAL - (time.time() - last_ts)
+        if wait > 0 and on_wait is not None:
+            on_wait(f"Throttling: waiting {wait:.0f}s before first request\u2026")
         _sleep_with_progress(wait, on_wait)
 
         try:
-            _last_request_at = time.monotonic()
+            _save_last_request_time(time.time())
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 return resp.read()
         except urllib.error.HTTPError as exc:
@@ -159,11 +200,20 @@ def _throttled_get(url: str, timeout: float,
             if exc.code == 429 or 500 <= exc.code < 600:
                 if attempt == MAX_RETRIES:
                     break
+                # Prefer the server's Retry-After guidance if provided.
+                retry_after = _parse_retry_after(
+                    exc.headers.get("Retry-After") if exc.headers else None
+                )
+                delay = min(MAX_BACKOFF, max(backoff, retry_after))
                 if on_wait is not None:
-                    on_wait(f"HTTP {exc.code}; backing off {backoff:.0f}s "
+                    on_wait(f"HTTP {exc.code} Too Many Requests; "
+                            f"waiting {delay:.0f}s "
                             f"(attempt {attempt}/{MAX_RETRIES})\u2026")
-                _sleep_with_progress(backoff, on_wait)
-                backoff *= 2
+                _sleep_with_progress(delay, on_wait)
+                # Push the next floor-check forward so the post-backoff call
+                # is separated from the failure by the full delay.
+                _save_last_request_time(time.time())
+                backoff = min(MAX_BACKOFF, backoff * 2)
                 continue
             raise  # non-retryable HTTP error
         except urllib.error.URLError as exc:
@@ -173,10 +223,12 @@ def _throttled_get(url: str, timeout: float,
             if on_wait is not None:
                 on_wait(f"Network error; retrying in {backoff:.0f}s\u2026")
             _sleep_with_progress(backoff, on_wait)
-            backoff *= 2
+            backoff = min(MAX_BACKOFF, backoff * 2)
 
     raise RuntimeError(
-        f"GDELT request failed after {MAX_RETRIES} attempts: {last_exc}"
+        f"GDELT request failed after {MAX_RETRIES} attempts: {last_exc}. "
+        f"GDELT's rate limit may still be active \u2014 wait a few minutes "
+        f"and try again."
     )
 
 
@@ -483,7 +535,7 @@ def main(argv: list[str] | None = None) -> int:
                              on_wait=on_wait)
 
     def _cli_status(msg: str) -> None:
-        print(msg, file=sys.stderr)
+        print(msg, file=sys.stderr, flush=True)
 
     try:
         stories = _fetch(_cli_status)
