@@ -256,11 +256,18 @@ def fetch_stories(
     raw_bytes = _throttled_get(url, timeout, on_wait)
     raw = raw_bytes.decode("utf-8", errors="replace")
 
-    # GDELT occasionally returns an HTML error page on bad queries; guard for it.
+    # GDELT returns a plain-text error message (not JSON) when the query is
+    # rejected, e.g. "Your query was too short or too long." Surface those as
+    # a clean error with a usage hint rather than a cryptic decode failure.
     try:
         payload = json.loads(raw)
     except json.JSONDecodeError as exc:
-        raise RuntimeError(f"GDELT returned non-JSON response: {raw[:200]}") from exc
+        msg = raw.strip()[:200] or "empty response"
+        raise RuntimeError(
+            f"GDELT rejected the query: {msg}\n"
+            f"Try a real keyword, e.g. "
+            f"'python gdelt_geotagger.py \"world news\"'."
+        ) from exc
 
     stories: list[Story] = []
     for art in payload.get("articles", []):
@@ -513,8 +520,9 @@ def run_ui(initial_stories: list[Story],
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    p.add_argument("query", nargs="?", default="*",
-                   help='GDELT query string. Defaults to "*" (latest worldwide).')
+    p.add_argument("query", nargs="?", default="world news",
+                   help='GDELT query string. Must be a real keyword or phrase '
+                        '(GDELT rejects "*"). Defaults to "world news".')
     p.add_argument("--max", type=int, default=75, dest="max_records",
                    help="Max records to return (GDELT caps at 250).")
     p.add_argument("--timespan", default="1h",
