@@ -120,10 +120,22 @@ function renderStories(stories) {
 }
 
 let currentRequest = 0;
+let currentAbort = null;
+
+// Hard ceiling for a single news request. Slightly above the server's
+// retry budget (15s timeout x 2 retries + backoffs) so slow-but-successful
+// calls still make it through, but runaway hangs don't pin the UI.
+const CLIENT_TIMEOUT_MS = 45000;
 
 async function loadNewsFor(countryName) {
   if (!countryName) return;
   const myRequest = ++currentRequest;
+
+  // Abort any previous in-flight request so rapid clicks don't pile up.
+  if (currentAbort) currentAbort.abort();
+  const controller = new AbortController();
+  currentAbort = controller;
+  const timer = setTimeout(() => controller.abort(), CLIENT_TIMEOUT_MS);
 
   document.getElementById("countryName").innerText = countryName;
   setStatus(`Loading news for ${countryName}\u2026`);
@@ -135,11 +147,10 @@ async function loadNewsFor(countryName) {
   try {
     const url = `/api/news?country=${encodeURIComponent(countryName)}` +
                 `&timespan=${encodeURIComponent(timespan)}&max=25`;
-    const resp = await fetch(url);
-    // If another click raced in, ignore this (stale) response.
+    const resp = await fetch(url, { signal: controller.signal });
     if (myRequest !== currentRequest) return;
 
-    const data = await resp.json();
+    const data = await resp.json().catch(() => ({}));
     if (!resp.ok) {
       setStatus(`Error: ${data.error || resp.statusText}`);
       return;
@@ -147,7 +158,15 @@ async function loadNewsFor(countryName) {
     renderStories(data.stories || []);
   } catch (err) {
     if (myRequest !== currentRequest) return;
-    setStatus(`Request failed: ${err.message || err}`);
+    if (err && err.name === "AbortError") {
+      setStatus(`Timed out after ${CLIENT_TIMEOUT_MS / 1000}s. ` +
+                `GDELT may be rate-limiting \u2014 try again in a minute.`);
+    } else {
+      setStatus(`Request failed: ${err.message || err}`);
+    }
+  } finally {
+    clearTimeout(timer);
+    if (currentAbort === controller) currentAbort = null;
   }
 }
 
