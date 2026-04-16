@@ -15,6 +15,8 @@ import curses
 import json
 import sys
 import textwrap
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import webbrowser
@@ -23,6 +25,15 @@ from dataclasses import asdict, dataclass, field
 from typing import Callable
 
 GDELT_DOC_URL = "https://api.gdeltproject.org/api/v2/doc/doc"
+
+# GDELT asks callers to stay under roughly one request every ~5 seconds; exceed
+# that and the edge starts returning 429 Too Many Requests. We enforce the
+# floor locally (no matter how often ``fetch_stories`` is called) and, when a
+# 429 slips through anyway, back off exponentially before retrying.
+MIN_REQUEST_INTERVAL = 5.0      # seconds between successive requests
+MAX_RETRIES = 4                 # total attempts on 429 / transient errors
+INITIAL_BACKOFF = 5.0           # first sleep on 429; doubles each retry
+_last_request_at: float = 0.0   # monotonic timestamp of the previous call
 
 # FIPS 10-4 country codes used by GDELT -> human-readable name.
 # Covers the codes most commonly seen in GDELT output. Anything missing
@@ -107,12 +118,75 @@ def _build_query_url(query: str, max_records: int, timespan: str, mode: str) -> 
     return f"{GDELT_DOC_URL}?{urllib.parse.urlencode(params)}"
 
 
+def _sleep_with_progress(seconds: float,
+                         on_wait: Callable[[str], None] | None) -> None:
+    """Sleep in one-second increments so callers can report progress."""
+    if seconds <= 0:
+        return
+    remaining = seconds
+    while remaining > 0:
+        if on_wait is not None:
+            on_wait(f"Rate limit: waiting {remaining:.0f}s\u2026")
+        step = 1.0 if remaining > 1.0 else remaining
+        time.sleep(step)
+        remaining -= step
+
+
+def _throttled_get(url: str, timeout: float,
+                   on_wait: Callable[[str], None] | None) -> bytes:
+    """Fetch ``url`` while honoring the module-level request interval and
+    retrying on 429 / transient 5xx responses with exponential backoff."""
+    global _last_request_at
+
+    req = urllib.request.Request(
+        url, headers={"User-Agent": "gdelt-geotagger/1.0"}
+    )
+    backoff = INITIAL_BACKOFF
+    last_exc: Exception | None = None
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        # Client-side floor: keep at least MIN_REQUEST_INTERVAL between calls.
+        wait = MIN_REQUEST_INTERVAL - (time.monotonic() - _last_request_at)
+        _sleep_with_progress(wait, on_wait)
+
+        try:
+            _last_request_at = time.monotonic()
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.read()
+        except urllib.error.HTTPError as exc:
+            last_exc = exc
+            # 429 = rate limited; 5xx = transient upstream issue. Back off.
+            if exc.code == 429 or 500 <= exc.code < 600:
+                if attempt == MAX_RETRIES:
+                    break
+                if on_wait is not None:
+                    on_wait(f"HTTP {exc.code}; backing off {backoff:.0f}s "
+                            f"(attempt {attempt}/{MAX_RETRIES})\u2026")
+                _sleep_with_progress(backoff, on_wait)
+                backoff *= 2
+                continue
+            raise  # non-retryable HTTP error
+        except urllib.error.URLError as exc:
+            last_exc = exc
+            if attempt == MAX_RETRIES:
+                break
+            if on_wait is not None:
+                on_wait(f"Network error; retrying in {backoff:.0f}s\u2026")
+            _sleep_with_progress(backoff, on_wait)
+            backoff *= 2
+
+    raise RuntimeError(
+        f"GDELT request failed after {MAX_RETRIES} attempts: {last_exc}"
+    )
+
+
 def fetch_stories(
     query: str,
     max_records: int = 75,
     timespan: str = "1h",
     mode: str = "ArtList",
     timeout: float = 30.0,
+    on_wait: Callable[[str], None] | None = None,
 ) -> list[Story]:
     """Query the GDELT DOC API and return geotagged ``Story`` records.
 
@@ -121,11 +195,14 @@ def fetch_stories(
     ``1h``, ``24h``, ``1d``. We default to a tight one-hour window plus
     ``sort=datedesc`` so the freshest stories come back first.
     ``max_records`` is capped at 250 by the upstream API.
+
+    Requests are throttled to one per ``MIN_REQUEST_INTERVAL`` seconds to stay
+    under GDELT's rate limit, and 429 responses trigger exponential backoff.
+    Pass ``on_wait`` to receive status strings while the client is sleeping.
     """
     url = _build_query_url(query, max_records, timespan, mode)
-    req = urllib.request.Request(url, headers={"User-Agent": "gdelt-geotagger/1.0"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        raw = resp.read().decode("utf-8", errors="replace")
+    raw_bytes = _throttled_get(url, timeout, on_wait)
+    raw = raw_bytes.decode("utf-8", errors="replace")
 
     # GDELT occasionally returns an HTML error page on bad queries; guard for it.
     try:
@@ -294,9 +371,11 @@ def _flash(stdscr, msg: str) -> None:
 
 
 def run_ui(initial_stories: list[Story],
-           refresh: Callable[[], list[Story]],
+           refresh: Callable[[Callable[[str], None]], list[Story]],
            query: str, timespan: str) -> None:
-    """Launch the curses browser. ``refresh`` re-runs the GDELT fetch."""
+    """Launch the curses browser. ``refresh`` re-runs the GDELT fetch and
+    accepts an ``on_wait`` callback so throttle/backoff status can be shown.
+    """
 
     def _loop(stdscr):
         curses.curs_set(0)
@@ -357,11 +436,16 @@ def run_ui(initial_stories: list[Story],
                 elif key in (curses.KEY_ENTER, 10, 13) and stories:
                     mode = "detail"
                 elif key == ord('r'):
-                    _flash(stdscr, "Refreshing from GDELT\u2026")
+                    def _status(msg: str) -> None:
+                        stdscr.erase()
+                        _draw_list(stdscr, stories, selected, scroll,
+                                   query, timespan, h, w)
+                        _flash(stdscr, msg)
+                    _status("Refreshing from GDELT\u2026")
                     try:
-                        stories = refresh()
+                        stories = refresh(_status)
                     except Exception as exc:  # noqa: BLE001 - surface in UI
-                        _flash(stdscr, f"Refresh failed: {exc}")
+                        _flash(stdscr, f"Refresh failed: {exc} (press a key)")
                         stdscr.getch()
             else:  # detail mode
                 if key in (curses.KEY_LEFT, 27, ord('b'), ord('h')):
@@ -394,11 +478,15 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv if argv is not None else sys.argv[1:])
 
-    def _fetch() -> list[Story]:
-        return fetch_stories(args.query, args.max_records, args.timespan)
+    def _fetch(on_wait: Callable[[str], None] | None = None) -> list[Story]:
+        return fetch_stories(args.query, args.max_records, args.timespan,
+                             on_wait=on_wait)
+
+    def _cli_status(msg: str) -> None:
+        print(msg, file=sys.stderr)
 
     try:
-        stories = _fetch()
+        stories = _fetch(_cli_status)
     except (urllib.error.URLError, RuntimeError) as exc:
         print(f"Error fetching GDELT data: {exc}", file=sys.stderr)
         return 1
