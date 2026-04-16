@@ -171,17 +171,19 @@ def _parse_retry_after(header: str | None) -> float:
 
 
 def _throttled_get(url: str, timeout: float,
-                   on_wait: Callable[[str], None] | None) -> bytes:
+                   on_wait: Callable[[str], None] | None,
+                   max_retries: int = MAX_RETRIES,
+                   initial_backoff: float = INITIAL_BACKOFF) -> bytes:
     """Fetch ``url`` while honoring the cross-run request interval and
     retrying on 429 / transient 5xx responses with exponential backoff."""
 
     req = urllib.request.Request(
         url, headers={"User-Agent": "gdelt-geotagger/1.0"}
     )
-    backoff = INITIAL_BACKOFF
+    backoff = initial_backoff
     last_exc: Exception | None = None
 
-    for attempt in range(1, MAX_RETRIES + 1):
+    for attempt in range(1, max_retries + 1):
         # Client-side floor: keep at least MIN_REQUEST_INTERVAL between calls
         # even across separate script invocations (state is persisted to disk).
         last_ts = _load_last_request_time()
@@ -198,7 +200,7 @@ def _throttled_get(url: str, timeout: float,
             last_exc = exc
             # 429 = rate limited; 5xx = transient upstream issue. Back off.
             if exc.code == 429 or 500 <= exc.code < 600:
-                if attempt == MAX_RETRIES:
+                if attempt == max_retries:
                     break
                 # Prefer the server's Retry-After guidance if provided.
                 retry_after = _parse_retry_after(
@@ -208,7 +210,7 @@ def _throttled_get(url: str, timeout: float,
                 if on_wait is not None:
                     on_wait(f"HTTP {exc.code} Too Many Requests; "
                             f"waiting {delay:.0f}s "
-                            f"(attempt {attempt}/{MAX_RETRIES})\u2026")
+                            f"(attempt {attempt}/{max_retries})\u2026")
                 _sleep_with_progress(delay, on_wait)
                 # Push the next floor-check forward so the post-backoff call
                 # is separated from the failure by the full delay.
@@ -218,7 +220,7 @@ def _throttled_get(url: str, timeout: float,
             raise  # non-retryable HTTP error
         except urllib.error.URLError as exc:
             last_exc = exc
-            if attempt == MAX_RETRIES:
+            if attempt == max_retries:
                 break
             if on_wait is not None:
                 on_wait(f"Network error; retrying in {backoff:.0f}s\u2026")
@@ -226,7 +228,7 @@ def _throttled_get(url: str, timeout: float,
             backoff = min(MAX_BACKOFF, backoff * 2)
 
     raise RuntimeError(
-        f"GDELT request failed after {MAX_RETRIES} attempts: {last_exc}. "
+        f"GDELT request failed after {max_retries} attempts: {last_exc}. "
         f"GDELT's rate limit may still be active \u2014 wait a few minutes "
         f"and try again."
     )
@@ -239,6 +241,8 @@ def fetch_stories(
     mode: str = "ArtList",
     timeout: float = 30.0,
     on_wait: Callable[[str], None] | None = None,
+    max_retries: int = MAX_RETRIES,
+    initial_backoff: float = INITIAL_BACKOFF,
 ) -> list[Story]:
     """Query the GDELT DOC API and return geotagged ``Story`` records.
 
@@ -253,7 +257,9 @@ def fetch_stories(
     Pass ``on_wait`` to receive status strings while the client is sleeping.
     """
     url = _build_query_url(query, max_records, timespan, mode)
-    raw_bytes = _throttled_get(url, timeout, on_wait)
+    raw_bytes = _throttled_get(url, timeout, on_wait,
+                               max_retries=max_retries,
+                               initial_backoff=initial_backoff)
     raw = raw_bytes.decode("utf-8", errors="replace")
 
     # GDELT returns a plain-text error message (not JSON) when the query is

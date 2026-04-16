@@ -18,12 +18,19 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import threading
 import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from gdelt_geotagger import fetch_stories
+
+# Web UX tolerates much less patience than the CLI. Fail fast so the browser
+# can show an error instead of hanging on a GDELT retry loop.
+WEB_TIMEOUT = 15.0          # per-request HTTP timeout
+WEB_MAX_RETRIES = 2         # total attempts on 429 / network errors
+WEB_INITIAL_BACKOFF = 4.0   # first retry delay; doubles up to MAX_BACKOFF
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 STATIC_FILES = {
@@ -65,12 +72,23 @@ def _stories_for_country(country: str, timespan: str, max_records: int) -> list[
             if cached and time.time() - cached[0] < _CACHE_TTL:
                 return cached[1]
 
+        def _on_wait(msg: str) -> None:
+            print(f"[gdelt:{country}] {msg}", file=sys.stderr, flush=True)
+
+        print(f"[gdelt:{country}] fetching (timespan={timespan}, max={max_records})",
+              file=sys.stderr, flush=True)
         stories = fetch_stories(
             _build_query(country),
             max_records=max_records,
             timespan=timespan,
+            timeout=WEB_TIMEOUT,
+            max_retries=WEB_MAX_RETRIES,
+            initial_backoff=WEB_INITIAL_BACKOFF,
+            on_wait=_on_wait,
         )
         payload = [s.to_dict() for s in stories]
+        print(f"[gdelt:{country}] returned {len(payload)} stories",
+              file=sys.stderr, flush=True)
 
         with _cache_lock:
             _cache[key] = (time.time(), payload)
@@ -81,8 +99,12 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "GdeltMapServer/1.0"
 
     def log_message(self, format: str, *args) -> None:  # noqa: A002 - stdlib sig
-        # Keep the console tidy; drop the default per-request noise.
-        return
+        # Drop 200s but keep error lines so users can see what's happening.
+        status = args[1] if len(args) >= 2 else ""
+        if status.startswith("2"):
+            return
+        sys.stderr.write("%s - - [%s] %s\n" % (
+            self.address_string(), self.log_date_time_string(), format % args))
 
     def _send_json(self, status: int, body: dict | list) -> None:
         data = json.dumps(body).encode("utf-8")
@@ -139,6 +161,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             stories = _stories_for_country(country, timespan, max_records)
         except Exception as exc:  # noqa: BLE001 - surface to client as JSON
+            import traceback
+            traceback.print_exc(file=sys.stderr)
             self._send_json(502, {"error": str(exc), "country": country})
             return
 
