@@ -51,16 +51,20 @@ const countryNames = {
   "DK": "Denmark", "GR": "Greece", "MY": "Malaysia",
 };
 
-// Resolve the best display name for a clicked SVG element. The map uses
-// two different conventions: single-path countries have id="XX" name="Name",
-// while multi-path countries repeat class="Name" on each piece.
+// Resolve the best display name for a clicked SVG element. The current
+// map encodes the name in a `title` attribute; older simplemaps exports
+// put it in `name`, and some multi-path countries used `class="Country"`.
+// Fall back through all three, then to the id-based lookup.
 function resolveCountryName(el) {
+  const titleAttr = el.getAttribute("title");
+  if (titleAttr) return titleAttr.trim();
+
   const nameAttr = el.getAttribute("name");
   if (nameAttr) return nameAttr.trim();
 
   const cls = (el.getAttribute("class") || "").trim();
-  // A class like "Angola" looks like a country name; skip utility classes.
-  if (cls && /^[A-Z][A-Za-z' .-]+$/.test(cls)) return cls;
+  // Skip generic utility classes (e.g. "land") that aren't country names.
+  if (cls && cls !== "land" && /^[A-Z][A-Za-z' .-]+$/.test(cls)) return cls;
 
   const id = (el.id || "").toUpperCase();
   if (countryNames[id]) return countryNames[id];
