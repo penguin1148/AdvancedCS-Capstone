@@ -59,13 +59,29 @@ def _api_key() -> str:
     return os.environ.get("FREENEWSAPI_KEY", "").strip() or _DEFAULT_API_KEY
 
 
+# We don't have authoritative docs for the exact auth scheme, so we try
+# every common name on the same request. Unknown query params and headers
+# are ignored by reasonable APIs, and whichever name the upstream actually
+# expects will be honored. If a 401 still comes back, we then iterate
+# `_FALLBACK_QUERY_NAMES` one at a time as a last resort.
+_QUERY_KEY_NAMES = ("api_token", "apikey", "api_key", "apiKey", "key", "token", "access_key")
+_FALLBACK_QUERY_NAMES = ("apikey", "api_key", "apiKey", "key", "token", "access_key")
+
+
 def _build_url(country_code: str, search: str, timespan: str,
-               max_records: int, language: str) -> str:
+               max_records: int, language: str,
+               key_name: str | None = None) -> str:
     params: dict[str, str] = {
-        "api_token": _api_key(),
         "limit": str(max(1, min(max_records, 100))),
         "language": language,
     }
+    key = _api_key()
+    if key_name is None:
+        # First try: send the key under every common name at once.
+        for name in _QUERY_KEY_NAMES:
+            params[name] = key
+    else:
+        params[key_name] = key
     code = (country_code or "").strip().lower()
     if code:
         # Different deployments call this `country` or `locale`; send both
@@ -142,6 +158,44 @@ def _to_story(article: dict, country_name: str) -> Story:
     )
 
 
+def _auth_headers() -> dict[str, str]:
+    """Send the key under every header convention we've seen in the wild
+    so the upstream picks up whichever one it expects."""
+    key = _api_key()
+    return {
+        "User-Agent": "gdelt-map/1.0",
+        "Accept": "application/json",
+        "X-Api-Key": key,
+        "X-API-Key": key,
+        "apikey": key,
+        "Authorization": f"Bearer {key}",
+    }
+
+
+def _do_request(url: str, timeout: float) -> bytes:
+    """Open ``url`` and return the body, mapping HTTP/URL errors to
+    RuntimeError with the upstream response body included when available."""
+    req = urllib.request.Request(url, headers=_auth_headers())
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read()
+    except urllib.error.HTTPError as exc:
+        try:
+            detail = exc.read().decode("utf-8", errors="replace")[:500]
+        except Exception:  # noqa: BLE001
+            detail = ""
+        # Re-raise as a typed wrapper that carries the status code so the
+        # caller can decide whether to fall back to a different auth name.
+        err = RuntimeError(
+            f"FreeNewsApi returned HTTP {exc.code}: {detail or exc.reason}"
+        )
+        err.status = exc.code  # type: ignore[attr-defined]
+        err.body = detail       # type: ignore[attr-defined]
+        raise err from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"FreeNewsApi network error: {exc.reason}") from exc
+
+
 def fetch_stories(
     country_code: str = "",
     country_name: str = "",
@@ -158,35 +212,38 @@ def fetch_stories(
     both are provided. ``country_name`` is only used to populate the
     ``primary_country`` field so the UI labels stories consistently.
     """
-    url = _build_url(country_code, search, timespan, max_records, language)
-    req = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": "gdelt-map/1.0",
-            "Accept": "application/json",
-            # Some deployments accept Bearer auth too; sending both is
-            # harmless if only one is honored.
-            "Authorization": f"Bearer {_api_key()}",
-        },
-    )
     if on_wait is not None:
         on_wait(f"FreeNewsApi: requesting {country_code or search}…")
 
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read()
-    except urllib.error.HTTPError as exc:
-        # Surface the body when present — the API typically returns JSON
-        # with a useful error message on 4xx.
+    # First attempt: shotgun every known query-param name + every header.
+    url = _build_url(country_code, search, timespan, max_records, language)
+    attempts: list[tuple[str, str]] = [("shotgun", url)]
+    # Fallbacks: one query-param name at a time, in case the upstream
+    # rejects requests carrying *unknown* parameters (some API gateways do).
+    for name in _FALLBACK_QUERY_NAMES:
+        attempts.append((name, _build_url(
+            country_code, search, timespan, max_records, language,
+            key_name=name,
+        )))
+
+    last_err: Exception | None = None
+    for label, attempt_url in attempts:
         try:
-            detail = exc.read().decode("utf-8", errors="replace")[:500]
-        except Exception:  # noqa: BLE001
-            detail = ""
-        raise RuntimeError(
-            f"FreeNewsApi returned HTTP {exc.code}: {detail or exc.reason}"
-        ) from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"FreeNewsApi network error: {exc.reason}") from exc
+            raw = _do_request(attempt_url, timeout)
+            break
+        except RuntimeError as exc:
+            last_err = exc
+            status = getattr(exc, "status", None)
+            body = (getattr(exc, "body", "") or "").lower()
+            # Only retry on auth failures; bail on anything else immediately.
+            if status not in (400, 401, 403) or "key" not in body:
+                raise
+            if on_wait is not None:
+                on_wait(f"FreeNewsApi: auth via {label} rejected, trying next…")
+    else:
+        # Every fallback failed; surface the most recent error.
+        assert last_err is not None
+        raise last_err
 
     try:
         payload = json.loads(raw.decode("utf-8", errors="replace"))
