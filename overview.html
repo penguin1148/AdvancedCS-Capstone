@@ -418,6 +418,13 @@
 <aside id="newsPanel">
   <h3>Country News</h3>
   <div class="news-controls">
+    <label for="sourceSelect">Source</label>
+    <select id="sourceSelect">
+      <option value="gdelt" selected>GDELT</option>
+      <option value="freenewsapi">FreeNewsApi</option>
+    </select>
+  </div>
+  <div class="news-controls">
     <label for="timespanSelect">Last</label>
     <select id="timespanSelect">
       <option value="1h">1 hour</option>
@@ -426,7 +433,6 @@
       <option value="3d">3 days</option>
       <option value="7d">7 days</option>
     </select>
-    <span style="margin-left:auto; font-size:12px;">via GDELT</span>
   </div>
   <div id="newsStatus">Click a country on the map to load stories.</div>
   <ul id="newsList"></ul>

@@ -51,24 +51,27 @@ const countryNames = {
   "DK": "Denmark", "GR": "Greece", "MY": "Malaysia",
 };
 
-// Resolve the best display name for a clicked SVG element. The current
-// map encodes the name in a `title` attribute; older simplemaps exports
-// put it in `name`, and some multi-path countries used `class="Country"`.
-// Fall back through all three, then to the id-based lookup.
-function resolveCountryName(el) {
+// Resolve the best display name and ISO code for a clicked SVG element.
+// The current map encodes the name in a `title` attribute and the ISO
+// alpha-2 code in `id`; older simplemaps exports used `name` or repeated
+// `class="Country"` for multi-path countries. Returns {name, code}.
+function resolveCountry(el) {
   const titleAttr = el.getAttribute("title");
-  if (titleAttr) return titleAttr.trim();
-
   const nameAttr = el.getAttribute("name");
-  if (nameAttr) return nameAttr.trim();
-
   const cls = (el.getAttribute("class") || "").trim();
-  // Skip generic utility classes (e.g. "land") that aren't country names.
-  if (cls && cls !== "land" && /^[A-Z][A-Za-z' .-]+$/.test(cls)) return cls;
+  const rawId = (el.id || "").toUpperCase();
+  // Some IDs include subregion suffixes like "UM-DQ"; the country code is
+  // the part before the dash.
+  const code = rawId.split("-")[0];
 
-  const id = (el.id || "").toUpperCase();
-  if (countryNames[id]) return countryNames[id];
-  return id || "";
+  let name = "";
+  if (titleAttr) name = titleAttr.trim();
+  else if (nameAttr) name = nameAttr.trim();
+  else if (cls && cls !== "land" && /^[A-Z][A-Za-z' .-]+$/.test(cls)) name = cls;
+  else if (countryNames[code]) name = countryNames[code];
+  else name = code || "";
+
+  return { name, code };
 }
 
 function formatSeenDate(raw) {
@@ -96,7 +99,8 @@ function renderStories(stories) {
     return;
   }
 
-  setStatus(`${stories.length} recent ${stories.length === 1 ? "story" : "stories"}.`);
+  const noun = stories.length === 1 ? "story" : "stories";
+  setStatus(`${stories.length} recent ${noun} via ${getSource()}.`);
 
   for (const s of stories) {
     const li = document.createElement("li");
@@ -125,14 +129,28 @@ function renderStories(stories) {
 
 let currentRequest = 0;
 let currentAbort = null;
+// Most-recently selected country, so toggling source/timespan can refetch
+// without requiring another click.
+let activeCountry = null;
 
 // Hard ceiling for a single news request. Slightly above the server's
 // retry budget (15s timeout x 2 retries + backoffs) so slow-but-successful
 // calls still make it through, but runaway hangs don't pin the UI.
 const CLIENT_TIMEOUT_MS = 45000;
 
-async function loadNewsFor(countryName) {
-  if (!countryName) return;
+function getSource() {
+  const el = document.getElementById("sourceSelect");
+  return (el && el.value) || "gdelt";
+}
+
+function getTimespan() {
+  const el = document.getElementById("timespanSelect");
+  return (el && el.value) || "24h";
+}
+
+async function loadNewsFor(country) {
+  if (!country || !country.name) return;
+  activeCountry = country;
   const myRequest = ++currentRequest;
 
   // Abort any previous in-flight request so rapid clicks don't pile up.
@@ -141,22 +159,27 @@ async function loadNewsFor(countryName) {
   currentAbort = controller;
   const timer = setTimeout(() => controller.abort(), CLIENT_TIMEOUT_MS);
 
-  document.getElementById("countryName").innerText = countryName;
-  setStatus(`Loading news for ${countryName}\u2026`);
+  const source = getSource();
+  const timespan = getTimespan();
+
+  document.getElementById("countryName").innerText = country.name;
+  setStatus(`Loading news for ${country.name} via ${source}\u2026`);
   document.getElementById("newsList").innerHTML = "";
 
-  const timespan =
-    (document.getElementById("timespanSelect") || {}).value || "24h";
-
   try {
-    const url = `/api/news?country=${encodeURIComponent(countryName)}` +
-                `&timespan=${encodeURIComponent(timespan)}&max=25`;
-    const resp = await fetch(url, { signal: controller.signal });
+    const params = new URLSearchParams({
+      country: country.name,
+      country_code: country.code || "",
+      source,
+      timespan,
+      max: "25",
+    });
+    const resp = await fetch(`/api/news?${params}`, { signal: controller.signal });
     if (myRequest !== currentRequest) return;
 
     const data = await resp.json().catch(() => ({}));
     if (!resp.ok) {
-      setStatus(`Error: ${data.error || resp.statusText}`);
+      setStatus(`Error (${source}): ${data.error || resp.statusText}`);
       return;
     }
     renderStories(data.stories || []);
@@ -164,7 +187,7 @@ async function loadNewsFor(countryName) {
     if (myRequest !== currentRequest) return;
     if (err && err.name === "AbortError") {
       setStatus(`Timed out after ${CLIENT_TIMEOUT_MS / 1000}s. ` +
-                `GDELT may be rate-limiting \u2014 try again in a minute.`);
+                `Upstream (${source}) may be rate-limiting \u2014 try again.`);
     } else {
       setStatus(`Request failed: ${err.message || err}`);
     }
@@ -178,22 +201,23 @@ window.onload = () => {
   const countries = document.querySelectorAll("svg path");
   countries.forEach(country => {
     country.addEventListener("click", () => {
-      const name = resolveCountryName(country);
-      if (!name) {
+      const info = resolveCountry(country);
+      if (!info.name) {
         setStatus("Could not identify that country.");
         return;
       }
-      loadNewsFor(name);
+      loadNewsFor(info);
     });
   });
 
-  const ts = document.getElementById("timespanSelect");
-  if (ts) {
-    ts.addEventListener("change", () => {
-      const current = document.getElementById("countryName").innerText;
-      if (current && current !== "None" && !current.startsWith("Country:")) {
-        loadNewsFor(current);
-      }
-    });
+  // Re-fetch when the user changes source or timespan, as long as we have
+  // a country selected.
+  for (const id of ["sourceSelect", "timespanSelect"]) {
+    const el = document.getElementById(id);
+    if (el) {
+      el.addEventListener("change", () => {
+        if (activeCountry) loadNewsFor(activeCountry);
+      });
+    }
   }
 };

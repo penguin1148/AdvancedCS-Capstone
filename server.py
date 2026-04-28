@@ -1,17 +1,21 @@
-"""Tiny local web server that marries the world-map UI with the GDELT
-geotagger.
+"""Tiny local web server that marries the world-map UI with two news
+sources: the GDELT geotagger and FreeNewsApi.io.
 
-Run ``python server.py`` and open http://localhost:8000/ in a browser. The
-server does two things:
+Run ``python server.py`` and open http://localhost:8000/ in a browser.
+The server does two things:
 
 1. Serves the static assets (``overview.html``, ``script.js``).
-2. Exposes ``GET /api/news?country=<name>&timespan=<win>&max=<n>`` which
-   reuses :func:`gdelt_geotagger.fetch_stories` to pull news mentioning the
-   clicked country and returns them as JSON.
+2. Exposes ``GET /api/news`` which proxies to either source. Query params:
 
-A small in-memory TTL cache sits in front of the GDELT call so rapid clicks
-on the same country don't spam the upstream API (which enforces a ~6s floor
-between requests).
+   - ``country``    - country display name (required)
+   - ``country_code`` - ISO 3166 alpha-2 code (optional, used by FreeNewsApi)
+   - ``source``    - ``gdelt`` (default) or ``freenewsapi``
+   - ``timespan`` - lookback window (e.g. ``1h``, ``24h``, ``7d``)
+   - ``max``      - max records to return
+
+A small in-memory TTL cache sits in front of upstream calls so rapid
+clicks on the same country don't hammer the providers (GDELT enforces a
+~6s floor; FreeNewsApi has a 5,000/day budget).
 """
 
 from __future__ import annotations
@@ -24,13 +28,16 @@ import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from gdelt_geotagger import fetch_stories
+import freenewsapi
+from gdelt_geotagger import fetch_stories as gdelt_fetch_stories
 
 # Web UX tolerates much less patience than the CLI. Fail fast so the browser
 # can show an error instead of hanging on a GDELT retry loop.
 WEB_TIMEOUT = 15.0          # per-request HTTP timeout
 WEB_MAX_RETRIES = 2         # total attempts on 429 / network errors
 WEB_INITIAL_BACKOFF = 4.0   # first retry delay; doubles up to MAX_BACKOFF
+
+VALID_SOURCES = {"gdelt", "freenewsapi"}
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 STATIC_FILES = {
@@ -39,15 +46,19 @@ STATIC_FILES = {
     "/script.js": ("script.js", "application/javascript; charset=utf-8"),
 }
 
-# Cache GDELT responses for a short window. Keyed by (country, timespan, max).
+# Cache responses for a short window. Keyed by (source, country, code, timespan, max).
 _CACHE_TTL = 120.0  # seconds
-_cache: dict[tuple[str, str, int], tuple[float, list[dict]]] = {}
+_cache: dict[tuple, tuple[float, list[dict]]] = {}
 _cache_lock = threading.Lock()
 # Serialize GDELT requests so concurrent clicks don't trip the rate limiter.
-_gdelt_lock = threading.Lock()
+# FreeNewsApi has no such floor, so it gets its own (uncontended) lock.
+_source_locks: dict[str, threading.Lock] = {
+    "gdelt": threading.Lock(),
+    "freenewsapi": threading.Lock(),
+}
 
 
-def _build_query(country: str) -> str:
+def _build_gdelt_query(country: str) -> str:
     """GDELT accepts a phrase; wrap multi-word country names in quotes so
     the API treats them as a single token."""
     country = country.strip()
@@ -56,8 +67,55 @@ def _build_query(country: str) -> str:
     return country
 
 
-def _stories_for_country(country: str, timespan: str, max_records: int) -> list[dict]:
-    key = (country.lower(), timespan, max_records)
+def _fetch_gdelt(country: str, country_code: str, timespan: str,
+                 max_records: int) -> list[dict]:
+    def _on_wait(msg: str) -> None:
+        print(f"[gdelt:{country}] {msg}", file=sys.stderr, flush=True)
+
+    print(f"[gdelt:{country}] fetching (timespan={timespan}, max={max_records})",
+          file=sys.stderr, flush=True)
+    stories = gdelt_fetch_stories(
+        _build_gdelt_query(country),
+        max_records=max_records,
+        timespan=timespan,
+        timeout=WEB_TIMEOUT,
+        max_retries=WEB_MAX_RETRIES,
+        initial_backoff=WEB_INITIAL_BACKOFF,
+        on_wait=_on_wait,
+    )
+    return [s.to_dict() for s in stories]
+
+
+def _fetch_freenewsapi(country: str, country_code: str, timespan: str,
+                       max_records: int) -> list[dict]:
+    def _on_wait(msg: str) -> None:
+        print(f"[freenewsapi:{country}] {msg}", file=sys.stderr, flush=True)
+
+    print(f"[freenewsapi:{country}] fetching (code={country_code}, "
+          f"timespan={timespan}, max={max_records})",
+          file=sys.stderr, flush=True)
+    stories = freenewsapi.fetch_stories(
+        country_code=country_code,
+        country_name=country,
+        # If we don't have an ISO code, fall back to keyword search by name.
+        search="" if country_code else country,
+        timespan=timespan,
+        max_records=max_records,
+        timeout=WEB_TIMEOUT,
+        on_wait=_on_wait,
+    )
+    return [s.to_dict() for s in stories]
+
+
+_FETCHERS = {
+    "gdelt": _fetch_gdelt,
+    "freenewsapi": _fetch_freenewsapi,
+}
+
+
+def _stories_for_country(source: str, country: str, country_code: str,
+                         timespan: str, max_records: int) -> list[dict]:
+    key = (source, country.lower(), country_code.lower(), timespan, max_records)
     now = time.time()
 
     with _cache_lock:
@@ -65,29 +123,15 @@ def _stories_for_country(country: str, timespan: str, max_records: int) -> list[
         if cached and now - cached[0] < _CACHE_TTL:
             return cached[1]
 
-    with _gdelt_lock:
+    with _source_locks[source]:
         # Re-check cache under lock; another thread may have filled it.
         with _cache_lock:
             cached = _cache.get(key)
             if cached and time.time() - cached[0] < _CACHE_TTL:
                 return cached[1]
 
-        def _on_wait(msg: str) -> None:
-            print(f"[gdelt:{country}] {msg}", file=sys.stderr, flush=True)
-
-        print(f"[gdelt:{country}] fetching (timespan={timespan}, max={max_records})",
-              file=sys.stderr, flush=True)
-        stories = fetch_stories(
-            _build_query(country),
-            max_records=max_records,
-            timespan=timespan,
-            timeout=WEB_TIMEOUT,
-            max_retries=WEB_MAX_RETRIES,
-            initial_backoff=WEB_INITIAL_BACKOFF,
-            on_wait=_on_wait,
-        )
-        payload = [s.to_dict() for s in stories]
-        print(f"[gdelt:{country}] returned {len(payload)} stories",
+        payload = _FETCHERS[source](country, country_code, timespan, max_records)
+        print(f"[{source}:{country}] returned {len(payload)} stories",
               file=sys.stderr, flush=True)
 
         with _cache_lock:
@@ -147,7 +191,9 @@ class Handler(BaseHTTPRequestHandler):
     def _handle_news(self, raw_query: str) -> None:
         params = urllib.parse.parse_qs(raw_query)
         country = (params.get("country") or [""])[0].strip()
+        country_code = (params.get("country_code") or [""])[0].strip()
         timespan = (params.get("timespan") or ["24h"])[0].strip() or "24h"
+        source = (params.get("source") or ["gdelt"])[0].strip().lower() or "gdelt"
         try:
             max_records = int((params.get("max") or ["25"])[0])
         except ValueError:
@@ -157,17 +203,28 @@ class Handler(BaseHTTPRequestHandler):
         if not country:
             self._send_json(400, {"error": "country parameter is required"})
             return
+        if source not in VALID_SOURCES:
+            self._send_json(400, {
+                "error": f"unknown source {source!r}; "
+                         f"use one of {sorted(VALID_SOURCES)}",
+            })
+            return
 
         try:
-            stories = _stories_for_country(country, timespan, max_records)
+            stories = _stories_for_country(source, country, country_code,
+                                           timespan, max_records)
         except Exception as exc:  # noqa: BLE001 - surface to client as JSON
             import traceback
             traceback.print_exc(file=sys.stderr)
-            self._send_json(502, {"error": str(exc), "country": country})
+            self._send_json(502, {
+                "error": str(exc), "country": country, "source": source,
+            })
             return
 
         self._send_json(200, {
+            "source": source,
             "country": country,
+            "country_code": country_code,
             "timespan": timespan,
             "count": len(stories),
             "stories": stories,
