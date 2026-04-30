@@ -44,6 +44,7 @@ STATIC_FILES = {
     "/": ("overview.html", "text/html; charset=utf-8"),
     "/overview.html": ("overview.html", "text/html; charset=utf-8"),
     "/script.js": ("script.js", "application/javascript; charset=utf-8"),
+    "/trustedsources.js": ("trustedsources.js", "application/javascript; charset=utf-8"),
 }
 
 # Cache responses for a short window. Keyed by (source, country, code, timespan, max).
