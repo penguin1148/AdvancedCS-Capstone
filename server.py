@@ -59,9 +59,18 @@ _source_locks: dict[str, threading.Lock] = {
 }
 
 
-def _build_gdelt_query(country: str) -> str:
-    """GDELT accepts a phrase; wrap multi-word country names in quotes so
-    the API treats them as a single token."""
+def _build_gdelt_query(country: str, domains: list[str] | None = None) -> str:
+    """Build a GDELT DOC query.
+
+    When ``domains`` is provided, the query selects recent stories *from*
+    those publishers (e.g. ``(domain:reuters.com OR domain:apnews.com)``),
+    so the API itself returns trusted-source stories instead of us
+    filtering after the fact. Falls back to a country-name keyword search
+    when no domain list is given.
+    """
+    if domains:
+        parts = " OR ".join(f"domain:{d}" for d in domains)
+        return f"({parts})"
     country = country.strip()
     if " " in country or "'" in country:
         return f'"{country}"'
@@ -69,14 +78,15 @@ def _build_gdelt_query(country: str) -> str:
 
 
 def _fetch_gdelt(country: str, country_code: str, timespan: str,
-                 max_records: int) -> list[dict]:
+                 max_records: int,
+                 domains: list[str] | None = None) -> list[dict]:
     def _on_wait(msg: str) -> None:
         print(f"[gdelt:{country}] {msg}", file=sys.stderr, flush=True)
 
-    print(f"[gdelt:{country}] fetching (timespan={timespan}, max={max_records})",
-          file=sys.stderr, flush=True)
+    print(f"[gdelt:{country}] fetching (timespan={timespan}, max={max_records}, "
+          f"domains={domains or '-'})", file=sys.stderr, flush=True)
     stories = gdelt_fetch_stories(
-        _build_gdelt_query(country),
+        _build_gdelt_query(country, domains),
         max_records=max_records,
         timespan=timespan,
         timeout=WEB_TIMEOUT,
@@ -88,7 +98,11 @@ def _fetch_gdelt(country: str, country_code: str, timespan: str,
 
 
 def _fetch_freenewsapi(country: str, country_code: str, timespan: str,
-                       max_records: int) -> list[dict]:
+                       max_records: int,
+                       domains: list[str] | None = None) -> list[dict]:
+    # FreeNewsApi has its own source filter; the trusted-domain list is
+    # GDELT-only, so we ignore it here.
+    del domains
     def _on_wait(msg: str) -> None:
         print(f"[freenewsapi:{country}] {msg}", file=sys.stderr, flush=True)
 
@@ -115,8 +129,10 @@ _FETCHERS = {
 
 
 def _stories_for_country(source: str, country: str, country_code: str,
-                         timespan: str, max_records: int) -> list[dict]:
-    key = (source, country.lower(), country_code.lower(), timespan, max_records)
+                         timespan: str, max_records: int,
+                         domains: tuple[str, ...] = ()) -> list[dict]:
+    key = (source, country.lower(), country_code.lower(), timespan,
+           max_records, domains)
     now = time.time()
 
     with _cache_lock:
@@ -131,7 +147,8 @@ def _stories_for_country(source: str, country: str, country_code: str,
             if cached and time.time() - cached[0] < _CACHE_TTL:
                 return cached[1]
 
-        payload = _FETCHERS[source](country, country_code, timespan, max_records)
+        payload = _FETCHERS[source](country, country_code, timespan,
+                                    max_records, domains=list(domains))
         print(f"[{source}:{country}] returned {len(payload)} stories",
               file=sys.stderr, flush=True)
 
@@ -201,6 +218,14 @@ class Handler(BaseHTTPRequestHandler):
             max_records = 25
         max_records = max(1, min(max_records, 75))
 
+        # Optional comma-separated allowlist of publisher domains. The client
+        # passes this for GDELT so the upstream query targets trusted sources
+        # directly instead of returning random stories that we'd then drop.
+        raw_domains = (params.get("domains") or [""])[0]
+        domains = tuple(
+            d.strip().lower() for d in raw_domains.split(",") if d.strip()
+        )
+
         if not country:
             self._send_json(400, {"error": "country parameter is required"})
             return
@@ -213,7 +238,7 @@ class Handler(BaseHTTPRequestHandler):
 
         try:
             stories = _stories_for_country(source, country, country_code,
-                                           timespan, max_records)
+                                           timespan, max_records, domains)
         except Exception as exc:  # noqa: BLE001 - surface to client as JSON
             import traceback
             traceback.print_exc(file=sys.stderr)

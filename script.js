@@ -89,26 +89,11 @@ function setStatus(msg) {
   if (el) el.textContent = msg;
 }
 
-// Match a story's GDELT `domain` (e.g. "www3.nhk.or.jp") against a trusted
-// publisher domain ("nhk.or.jp"). Accepts an exact match or a subdomain.
-function domainMatches(storyDomain, trustedDomain) {
-  if (!storyDomain || !trustedDomain) return false;
-  const s = storyDomain.toLowerCase();
-  const t = trustedDomain.toLowerCase();
-  return s === t || s.endsWith("." + t);
-}
-
-function filterTrustedGdelt(stories, countryCode) {
-  const allowed = (typeof trustedSourceDomains !== "undefined")
-    ? trustedSourceDomains[countryCode]
-    : null;
-  if (!allowed || allowed.length === 0) {
-    return { stories, filtered: false };
-  }
-  const kept = stories.filter(s =>
-    allowed.some(d => domainMatches(s.domain, d))
-  );
-  return { stories: kept, filtered: true, totalFetched: stories.length };
+// Trusted-source domains for a country, or null if none are configured.
+function trustedDomainsFor(countryCode) {
+  if (typeof trustedSourceDomains === "undefined") return null;
+  const list = trustedSourceDomains[(countryCode || "").toUpperCase()];
+  return (list && list.length) ? list : null;
 }
 
 function renderStories(stories, opts) {
@@ -118,9 +103,8 @@ function renderStories(stories, opts) {
 
   const info = opts || {};
   if (!stories || stories.length === 0) {
-    if (info.filtered) {
-      setStatus(`No stories from trusted sources in the last fetch ` +
-                `(${info.totalFetched || 0} total, none matched).`);
+    if (info.trusted) {
+      setStatus(`No recent stories from trusted sources via ${getSource()}.`);
     } else {
       setStatus("No recent stories found.");
     }
@@ -128,9 +112,8 @@ function renderStories(stories, opts) {
   }
 
   const noun = stories.length === 1 ? "story" : "stories";
-  if (info.filtered) {
-    setStatus(`${stories.length} trusted ${noun} via ${getSource()} ` +
-              `(filtered from ${info.totalFetched}).`);
+  if (info.trusted) {
+    setStatus(`${stories.length} trusted ${noun} via ${getSource()}.`);
   } else {
     setStatus(`${stories.length} recent ${noun} via ${getSource()}.`);
   }
@@ -196,8 +179,17 @@ async function loadNewsFor(country) {
   const timespan = getTimespan();
 
   document.getElementById("countryName").innerText = country.name;
-  setStatus(`Loading news for ${country.name} via ${source}\u2026`);
   document.getElementById("newsList").innerHTML = "";
+
+  // For GDELT, restrict the upstream query to this country's trusted
+  // publishers so we get 25 stories drawn from those sources directly,
+  // instead of 25 random stories that we'd have to filter down.
+  const trustedDomains = source === "gdelt" ? trustedDomainsFor(country.code) : null;
+  if (source === "gdelt" && !trustedDomains) {
+    setStatus(`No trusted sources configured for ${country.name}.`);
+    return;
+  }
+  setStatus(`Loading news for ${country.name} via ${source}\u2026`);
 
   try {
     const params = new URLSearchParams({
@@ -207,6 +199,7 @@ async function loadNewsFor(country) {
       timespan,
       max: "25",
     });
+    if (trustedDomains) params.set("domains", trustedDomains.join(","));
     const resp = await fetch(`/api/news?${params}`, { signal: controller.signal });
     if (myRequest !== currentRequest) return;
 
@@ -215,14 +208,7 @@ async function loadNewsFor(country) {
       setStatus(`Error (${source}): ${data.error || resp.statusText}`);
       return;
     }
-    let stories = data.stories || [];
-    let renderOpts;
-    if (source === "gdelt") {
-      const result = filterTrustedGdelt(stories, (country.code || "").toUpperCase());
-      stories = result.stories;
-      renderOpts = result;
-    }
-    renderStories(stories, renderOpts);
+    renderStories(data.stories || [], { trusted: !!trustedDomains });
   } catch (err) {
     if (myRequest !== currentRequest) return;
     if (err && err.name === "AbortError") {
