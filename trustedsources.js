@@ -1,5 +1,9 @@
 // Top 5 reliable / reputable news sources by country
 // Use this in script.js
+//
+// `trustedSources` lists the human-readable source names; the parallel
+// `trustedSourceDomains` map below holds the publisher domains we use to
+// filter GDELT results (which expose a `domain` field, not a source name).
 
 const trustedSources = {
   US: [
@@ -160,5 +164,171 @@ const trustedSources = {
     "Gulf News",
     "Khaleej Times",
     "Arab News"
+  ]
+};
+
+// Publisher domains for each trusted source, keyed by ISO 3166 alpha-2 code.
+// A story counts as trusted if its GDELT `domain` equals one of these or is a
+// subdomain of one (e.g. `www3.nhk.or.jp` matches `nhk.or.jp`). Order mirrors
+// `trustedSources` above for easy auditing.
+const trustedSourceDomains = {
+  US: [
+    "reuters.com",
+    "apnews.com", "ap.org",
+    "npr.org",
+    "pbs.org",
+    "wsj.com"
+  ],
+
+  IN: [
+    "thehindu.com",
+    "indianexpress.com",
+    "reuters.com",
+    "bbc.com", "bbc.co.uk",
+    "ndtv.com"
+  ],
+
+  GB: [
+    "bbc.com", "bbc.co.uk",
+    "reuters.com",
+    "ft.com",
+    "theguardian.com",
+    "news.sky.com", "sky.com"
+  ],
+
+  CA: [
+    "cbc.ca",
+    "reuters.com",
+    "theglobeandmail.com",
+    "ctvnews.ca",
+    "nationalpost.com"
+  ],
+
+  AU: [
+    "abc.net.au",
+    "reuters.com",
+    "smh.com.au",
+    "sbs.com.au",
+    "theaustralian.com.au"
+  ],
+
+  FR: [
+    "france24.com",
+    "reuters.com",
+    "lemonde.fr",
+    "afp.com",
+    "euronews.com"
+  ],
+
+  DE: [
+    "dw.com",
+    "reuters.com",
+    "spiegel.de",
+    "faz.net",
+    "tagesschau.de"
+  ],
+
+  JP: [
+    "nhk.or.jp",
+    "reuters.com",
+    "japantimes.co.jp",
+    "kyodonews.net",
+    "asia.nikkei.com"
+  ],
+
+  BR: [
+    "reuters.com",
+    "folha.uol.com.br",
+    "oglobo.globo.com", "globo.com",
+    "estadao.com.br",
+    "uol.com.br"
+  ],
+
+  MX: [
+    "reuters.com",
+    "eluniversal.com.mx",
+    "milenio.com",
+    "jornada.com.mx",
+    "animalpolitico.com"
+  ],
+
+  ES: [
+    "reuters.com",
+    "elpais.com",
+    "rtve.es",
+    "abc.es",
+    "lavanguardia.com"
+  ],
+
+  IT: [
+    "reuters.com",
+    "ansa.it",
+    "corriere.it",
+    "repubblica.it",
+    "rainews.it"
+  ],
+
+  KR: [
+    "yna.co.kr",
+    "reuters.com",
+    "koreaherald.com",
+    "kbs.co.kr",
+    "koreajoongangdaily.joins.com"
+  ],
+
+  CN: [
+    "reuters.com",
+    "caixinglobal.com", "caixin.com",
+    "scmp.com",
+    "xinhuanet.com", "news.cn",
+    "chinadaily.com.cn"
+  ],
+
+  RU: [
+    "reuters.com",
+    "meduza.io",
+    "tass.com", "tass.ru",
+    "novayagazeta.eu", "novayagazeta.ru",
+    "themoscowtimes.com"
+  ],
+
+  ZA: [
+    "reuters.com",
+    "news24.com",
+    "mg.co.za",
+    "businesslive.co.za",
+    "sabcnews.com"
+  ],
+
+  NG: [
+    "reuters.com",
+    "punchng.com",
+    "premiumtimesng.com",
+    "channelstv.com",
+    "guardian.ng"
+  ],
+
+  PK: [
+    "reuters.com",
+    "dawn.com",
+    "thenews.com.pk",
+    "geo.tv",
+    "tribune.com.pk"
+  ],
+
+  SG: [
+    "reuters.com",
+    "straitstimes.com",
+    "channelnewsasia.com",
+    "todayonline.com",
+    "businesstimes.com.sg"
+  ],
+
+  AE: [
+    "reuters.com",
+    "thenationalnews.com",
+    "gulfnews.com",
+    "khaleejtimes.com",
+    "arabnews.com"
   ]
 };
