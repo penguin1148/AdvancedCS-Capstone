@@ -89,18 +89,51 @@ function setStatus(msg) {
   if (el) el.textContent = msg;
 }
 
-function renderStories(stories) {
+// Match a story's GDELT `domain` (e.g. "www3.nhk.or.jp") against a trusted
+// publisher domain ("nhk.or.jp"). Accepts an exact match or a subdomain.
+function domainMatches(storyDomain, trustedDomain) {
+  if (!storyDomain || !trustedDomain) return false;
+  const s = storyDomain.toLowerCase();
+  const t = trustedDomain.toLowerCase();
+  return s === t || s.endsWith("." + t);
+}
+
+function filterTrustedGdelt(stories, countryCode) {
+  const allowed = (typeof trustedSourceDomains !== "undefined")
+    ? trustedSourceDomains[countryCode]
+    : null;
+  if (!allowed || allowed.length === 0) {
+    return { stories, filtered: false };
+  }
+  const kept = stories.filter(s =>
+    allowed.some(d => domainMatches(s.domain, d))
+  );
+  return { stories: kept, filtered: true, totalFetched: stories.length };
+}
+
+function renderStories(stories, opts) {
   const list = document.getElementById("newsList");
   if (!list) return;
   list.innerHTML = "";
 
+  const info = opts || {};
   if (!stories || stories.length === 0) {
-    setStatus("No recent stories found.");
+    if (info.filtered) {
+      setStatus(`No stories from trusted sources in the last fetch ` +
+                `(${info.totalFetched || 0} total, none matched).`);
+    } else {
+      setStatus("No recent stories found.");
+    }
     return;
   }
 
   const noun = stories.length === 1 ? "story" : "stories";
-  setStatus(`${stories.length} recent ${noun} via ${getSource()}.`);
+  if (info.filtered) {
+    setStatus(`${stories.length} trusted ${noun} via ${getSource()} ` +
+              `(filtered from ${info.totalFetched}).`);
+  } else {
+    setStatus(`${stories.length} recent ${noun} via ${getSource()}.`);
+  }
 
   for (const s of stories) {
     const li = document.createElement("li");
@@ -182,7 +215,14 @@ async function loadNewsFor(country) {
       setStatus(`Error (${source}): ${data.error || resp.statusText}`);
       return;
     }
-    renderStories(data.stories || []);
+    let stories = data.stories || [];
+    let renderOpts;
+    if (source === "gdelt") {
+      const result = filterTrustedGdelt(stories, (country.code || "").toUpperCase());
+      stories = result.stories;
+      renderOpts = result;
+    }
+    renderStories(stories, renderOpts);
   } catch (err) {
     if (myRequest !== currentRequest) return;
     if (err && err.name === "AbortError") {
