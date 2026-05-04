@@ -2,102 +2,81 @@
 <html>
 <head>
   <title>Interactive World Map</title>
-
   <style>
     body {
       font-family: Arial;
       text-align: center;
     }
-
     #map {
       width: 90%;
       margin: auto;
     }
-
     svg {
       width: 100%;
       max-width: 1000px;
     }
-
     svg path {
       fill: lightgray;
-      stroke: white;
+      stroke: rgb(0, 0, 0);
       cursor: pointer;
       transition: 0.2s;
     }
-
     svg path:hover {
       fill: orange;
     }
-
     #selectionBox {
       margin-top: 20px;
       font-size: 18px;
     }
-
     button {
       margin-top: 10px;
       padding: 8px 15px;
       font-size: 16px;
       cursor: pointer;
-
-    
     }
     #searchContainer {
-  margin: 15px auto;
-  width: 300px;
-  position: relative;
-}
-
-#searchInput {
-  width: 100%;
-  padding: 8px 12px;
-  font-size: 16px;
-  border: 1px solid #ccc;
-  border-radius: 6px;
-  box-sizing: border-box;
-}
-
-#dropdown {
-  position: absolute;
-  width: 100%;
-  background: white;
-  border: 1px solid #ccc;
-  border-top: none;
-  border-radius: 0 0 6px 6px;
-  max-height: 200px;
-  overflow-y: auto;
-  z-index: 999;
-  display: none;
-}
-
-#dropdown div {
-  padding: 8px 12px;
-  cursor: pointer;
-  text-align: left;
-  font-size: 15px;
-}
-
-#dropdown div:hover {
-  background: #f0f0f0;
-}
+      margin: 15px auto;
+      width: 300px;
+      position: relative;
+    }
+    #searchInput {
+      width: 100%;
+      padding: 8px 12px;
+      font-size: 16px;
+      border: 1px solid #ccc;
+      border-radius: 6px;
+      box-sizing: border-box;
+    }
+    #dropdown {
+      position: absolute;
+      width: 100%;
+      background: white;
+      border: 1px solid #ccc;
+      border-top: none;
+      border-radius: 0 0 6px 6px;
+      max-height: 200px;
+      overflow-y: auto;
+      z-index: 999;
+      display: none;
+    }
+    #dropdown div {
+      padding: 8px 12px;
+      cursor: pointer;
+      text-align: left;
+      font-size: 15px;
+    }
+    #dropdown div:hover {
+      background: #f0f0f0;
+    }
   </style>
 </head>
-
 <body>
 
 <h2>Select 2 Countries</h2>
 
 <div id="map">
-
-  <!-- 🌍 PASTE YOUR SIMPLEMAPS SVG HERE -->
-  <!-- Example:
-  <svg xmlns="http://www.w3.org/2000/svg" viewBox="...">
-    <path id="us" d="..." />
-    <path id="fr" d="..." />
-  </svg>
-  -->
-<?xml version="1.0" encoding="UTF-8"?>
+  <!-- PASTE YOUR SVG MAP HERE -->
+   <?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" width="965" height="503" viewBox="-2.5 70.5 965 503">
   <!-- Created using SVG Map Generator: dojo.amcharts.com/svg-map-generator -->
   <style>
@@ -378,30 +357,41 @@
 
 <script>
 // -----------------------------
-// SELECTION STATE
+// STATE
 // -----------------------------
 let selectedCountries = [];
 let highlightedEls = [];
+let clickPoints = [];
+let countryList = [];
 
-// IDs to ignore when walking up the DOM
 const IGNORE_IDS = new Set(["polygons", "layers", "layer", "map", "svg", "world"]);
 
 // -----------------------------
 // INIT
 // -----------------------------
 window.onload = () => {
+  buildCountryList();
+
+  document.getElementById("searchInput").addEventListener("input", handleSearch);
+
+  document.addEventListener("click", (e) => {
+    if (!document.getElementById("searchContainer").contains(e.target)) {
+      closeDropdown();
+    }
+  });
+
   const regions = document.querySelectorAll("svg path, svg g");
   regions.forEach(region => {
     region.addEventListener("click", (e) => {
       e.stopPropagation();
-      handleClick(region);
+      const svgPoint = getSVGPoint(e);
+      handleClick(region, svgPoint);
     });
   });
 };
 
 // -----------------------------
-// FIND COUNTRY ID
-// Walk up DOM to find nearest meaningful ID
+// GET COUNTRY CODE
 // -----------------------------
 function getCountryCode(el) {
   let node = el;
@@ -418,14 +408,12 @@ function getCountryCode(el) {
 // -----------------------------
 // CLICK HANDLER
 // -----------------------------
-function handleClick(region) {
+function handleClick(region, point) {
   const code = getCountryCode(region);
   if (!code) return;
 
-  // Prevent duplicate selection
   if (selectedCountries.includes(code)) return;
 
-  // Auto-reset on 3rd click, then register as country 1
   if (selectedCountries.length >= 2) {
     resetSelection();
   }
@@ -433,13 +421,22 @@ function handleClick(region) {
   selectedCountries.push(code);
   highlightedEls.push(region);
 
-  const color = selectedCountries.length === 1 ? "blue" : "yellow";
+  // Store exact click point, fall back to bounding box center for search
+  if (point) {
+    clickPoints.push(point);
+  } else {
+    clickPoints.push(getCenterOfElement(region));
+  }
+
+  const color = selectedCountries.length === 1 ? "lightblue" : "yellow";
   region.style.fill = color;
 
   const slot = selectedCountries.length === 1 ? "country1" : "country2";
   document.getElementById(slot).innerText = code;
 
-  console.log("Selected:", code);
+  if (selectedCountries.length === 2) {
+    drawArc(clickPoints[0], clickPoints[1]);
+  }
 }
 
 // -----------------------------
@@ -447,29 +444,78 @@ function handleClick(region) {
 // -----------------------------
 function resetSelection() {
   selectedCountries = [];
+  clickPoints = [];
 
   highlightedEls.forEach(el => { el.style.fill = ""; });
   highlightedEls = [];
 
   document.getElementById("country1").innerText = "None";
   document.getElementById("country2").innerText = "None";
+
+  clearArc();
 }
+
+// -----------------------------
+// SVG COORDINATE CONVERSION
+// -----------------------------
+function getSVGPoint(e) {
+  const svg = document.querySelector("svg");
+  const pt = svg.createSVGPoint();
+  pt.x = e.clientX;
+  pt.y = e.clientY;
+  return pt.matrixTransform(svg.getScreenCTM().inverse());
+}
+
+// -----------------------------
+// BOUNDING BOX CENTER (fallback for search)
+// -----------------------------
+function getCenterOfElement(el) {
+  const bbox = el.getBBox();
+  return {
+    x: bbox.x + bbox.width / 2,
+    y: bbox.y + bbox.height / 2
+  };
+}
+
+// -----------------------------
+// ARC
+// -----------------------------
+function drawArc(p1, p2) {
+  const svg = document.querySelector("svg");
+  clearArc();
+
+  const mx = (p1.x + p2.x) / 2;
+  const my = (p1.y + p2.y) / 2;
+
+  const dx = p2.x - p1.x;
+  const dy = p2.y - p1.y;
+  const distance = Math.sqrt(dx * dx + dy * dy);
+
+  const curvature = 0.1; // Adjust this for more/less curve
+  const cx = mx;
+  const cy = my - distance * curvature;
+
+  const arc = document.createElementNS("http://www.w3.org/2000/svg", "path");
+  arc.setAttribute("id", "flightArc");
+  arc.setAttribute("d", `M ${p1.x} ${p1.y} Q ${cx} ${cy} ${p2.x} ${p2.y}`);
+  arc.setAttribute("fill", "none");
+  arc.setAttribute("fill-opacity", "0");
+  arc.setAttribute("stroke", "black");
+  arc.setAttribute("stroke-width", "1.5");
+  arc.setAttribute("stroke-linecap", "round");
+  arc.setAttribute("pointer-events", "none");
+  svg.appendChild(arc);
+}
+
+function clearArc() {
+  const existing = document.getElementById("flightArc");
+  if (existing) existing.remove();
+  document.querySelectorAll(".arcDot").forEach(d => d.remove());
+}
+
 // -----------------------------
 // SEARCH BAR
 // -----------------------------
-window.addEventListener("load", () => {
-  buildCountryList();
-
-  document.getElementById("searchInput").addEventListener("input", handleSearch);
-  document.addEventListener("click", (e) => {
-    if (!document.getElementById("searchContainer").contains(e.target)) {
-      closeDropdown();
-    }
-  });
-});
-
-let countryList = []; // { id, el }
-
 function buildCountryList() {
   const seen = new Set();
   document.querySelectorAll("svg path, svg g").forEach(el => {
@@ -503,7 +549,7 @@ function handleSearch() {
     const option = document.createElement("div");
     option.textContent = id;
     option.addEventListener("click", () => {
-      handleClick(el);
+      handleClick(el, null);
       document.getElementById("searchInput").value = "";
       closeDropdown();
     });
