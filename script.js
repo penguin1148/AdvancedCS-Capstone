@@ -164,6 +164,11 @@ function getTimespan() {
   return (el && el.value) || "24h";
 }
 
+function isTrustedFilterOn() {
+  const el = document.getElementById("trustedToggle");
+  return el ? el.checked : true;
+}
+
 async function loadNewsFor(country) {
   if (!country || !country.name) return;
   activeCountry = country;
@@ -181,12 +186,17 @@ async function loadNewsFor(country) {
   document.getElementById("countryName").innerText = country.name;
   document.getElementById("newsList").innerHTML = "";
 
-  // For GDELT, restrict the upstream query to this country's trusted
-  // publishers so we get 25 stories drawn from those sources directly,
-  // instead of 25 random stories that we'd have to filter down.
-  const trustedDomains = source === "gdelt" ? trustedDomainsFor(country.code) : null;
-  if (source === "gdelt" && !trustedDomains) {
-    setStatus(`No trusted sources configured for ${country.name}.`);
+  // For GDELT with the trusted filter on, restrict the upstream query to
+  // this country's trusted publishers so the API returns stories drawn from
+  // those sources directly. Otherwise fall through to the country-keyword
+  // query (the normal GDELT search).
+  const trustedOn = isTrustedFilterOn();
+  const trustedDomains = (source === "gdelt" && trustedOn)
+    ? trustedDomainsFor(country.code)
+    : null;
+  if (source === "gdelt" && trustedOn && !trustedDomains) {
+    setStatus(`No trusted sources configured for ${country.name}. ` +
+              `Uncheck "Trusted sources only" to see all GDELT results.`);
     return;
   }
   setStatus(`Loading news for ${country.name} via ${source}\u2026`);
@@ -238,7 +248,7 @@ window.onload = () => {
 
   // Re-fetch when the user changes source or timespan, as long as we have
   // a country selected.
-  for (const id of ["sourceSelect", "timespanSelect"]) {
+  for (const id of ["sourceSelect", "timespanSelect", "trustedToggle"]) {
     const el = document.getElementById(id);
     if (el) {
       el.addEventListener("change", () => {
