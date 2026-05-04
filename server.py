@@ -77,24 +77,61 @@ def _build_gdelt_query(country: str, domains: list[str] | None = None) -> str:
     return country
 
 
+def _balance_by_domain(stories: list[dict], domains: list[str],
+                       max_records: int) -> list[dict]:
+    """Round-robin stories across the given trusted domains so the result is
+    a balanced mix instead of being dominated by whichever publisher had the
+    most recent activity. A story matches a domain by exact equality or
+    subdomain (so ``www.reuters.com`` lands in ``reuters.com``).
+    """
+    buckets: dict[str, list[dict]] = {d: [] for d in domains}
+    for story in stories:
+        sd = (story.get("domain") or "").lower()
+        for d in domains:
+            if sd == d or sd.endswith("." + d):
+                buckets[d].append(story)
+                break
+
+    out: list[dict] = []
+    while len(out) < max_records:
+        progress = False
+        for d in domains:
+            if buckets[d]:
+                out.append(buckets[d].pop(0))
+                progress = True
+                if len(out) >= max_records:
+                    break
+        if not progress:
+            break
+    return out
+
+
 def _fetch_gdelt(country: str, country_code: str, timespan: str,
                  max_records: int,
                  domains: list[str] | None = None) -> list[dict]:
     def _on_wait(msg: str) -> None:
         print(f"[gdelt:{country}] {msg}", file=sys.stderr, flush=True)
 
-    print(f"[gdelt:{country}] fetching (timespan={timespan}, max={max_records}, "
+    # When restricting to a trusted-domain allowlist, pull a much larger
+    # upstream pool (GDELT caps at 250) so each publisher has enough stories
+    # to contribute when we round-robin them into a balanced result.
+    upstream_max = 250 if domains else max_records
+    print(f"[gdelt:{country}] fetching (timespan={timespan}, "
+          f"upstream_max={upstream_max}, return_max={max_records}, "
           f"domains={domains or '-'})", file=sys.stderr, flush=True)
     stories = gdelt_fetch_stories(
         _build_gdelt_query(country, domains),
-        max_records=max_records,
+        max_records=upstream_max,
         timespan=timespan,
         timeout=WEB_TIMEOUT,
         max_retries=WEB_MAX_RETRIES,
         initial_backoff=WEB_INITIAL_BACKOFF,
         on_wait=_on_wait,
     )
-    return [s.to_dict() for s in stories]
+    payload = [s.to_dict() for s in stories]
+    if domains:
+        payload = _balance_by_domain(payload, domains, max_records)
+    return payload
 
 
 def _fetch_freenewsapi(country: str, country_code: str, timespan: str,
@@ -213,10 +250,10 @@ class Handler(BaseHTTPRequestHandler):
         timespan = (params.get("timespan") or ["24h"])[0].strip() or "24h"
         source = (params.get("source") or ["gdelt"])[0].strip().lower() or "gdelt"
         try:
-            max_records = int((params.get("max") or ["25"])[0])
+            max_records = int((params.get("max") or ["50"])[0])
         except ValueError:
-            max_records = 25
-        max_records = max(1, min(max_records, 75))
+            max_records = 50
+        max_records = max(1, min(max_records, 100))
 
         # Optional comma-separated allowlist of publisher domains. The client
         # passes this for GDELT so the upstream query targets trusted sources
