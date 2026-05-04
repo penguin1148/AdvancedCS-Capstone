@@ -197,7 +197,7 @@ async function loadNewsFor(country) {
       country_code: country.code || "",
       source,
       timespan,
-      max: "25",
+      max: "50",
     });
     if (trustedDomains) params.set("domains", trustedDomains.join(","));
     const resp = await fetch(`/api/news?${params}`, { signal: controller.signal });
