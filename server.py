@@ -32,12 +32,19 @@ import freenewsapi
 from gdelt_geotagger import fetch_stories as gdelt_fetch_stories
 
 # Web UX tolerates much less patience than the CLI. Fail fast so the browser
-# can show an error instead of hanging on a GDELT retry loop.
-WEB_TIMEOUT = 15.0          # per-request HTTP timeout
-WEB_MAX_RETRIES = 2         # total attempts on 429 / network errors
-WEB_INITIAL_BACKOFF = 4.0   # first retry delay; doubles up to MAX_BACKOFF
+# can show an error (or stale cached data) instead of hanging on a retry loop.
+WEB_TIMEOUT = 8.0           # per-request HTTP timeout
+WEB_MAX_RETRIES = 1         # total attempts on 429 / network errors
+WEB_INITIAL_BACKOFF = 1.0   # first retry delay; doubles up to WEB_MAX_BACKOFF
+WEB_MAX_BACKOFF = 3.0       # never wait more than this between web retries
 
 VALID_SOURCES = {"gdelt", "freenewsapi"}
+
+# When an upstream returns 429 / errors out, mark it unhealthy for this long
+# so the next request goes straight to the stale cache instead of repeating
+# the same slow failure.
+_UNHEALTHY_COOLDOWN = 90.0
+_unhealthy_until: dict[str, float] = {"gdelt": 0.0, "freenewsapi": 0.0}
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 STATIC_FILES = {
@@ -48,8 +55,13 @@ STATIC_FILES = {
     "/trustedsources.js": ("trustedsources.js", "application/javascript; charset=utf-8"),
 }
 
-# Cache responses for a short window. Keyed by (source, country, code, timespan, max).
-_CACHE_TTL = 120.0  # seconds
+# Cache responses. The fresh window is what we serve without re-querying;
+# the stale window is a fallback we serve when the upstream errors out so
+# the user always sees stories instead of a red error message. The user has
+# explicitly opted in to "not the very latest news" in exchange for speed,
+# so these are sized aggressively.
+_CACHE_TTL = 1800.0   # 30 min: fresh enough, fast enough
+_STALE_TTL = 21600.0  # 6 hours: served only when a refetch fails
 _cache: dict[tuple, tuple[float, list[dict]]] = {}
 _cache_lock = threading.Lock()
 # Serialize GDELT requests so concurrent clicks don't trip the rate limiter.
@@ -127,6 +139,7 @@ def _fetch_gdelt(country: str, country_code: str, timespan: str,
         timeout=WEB_TIMEOUT,
         max_retries=WEB_MAX_RETRIES,
         initial_backoff=WEB_INITIAL_BACKOFF,
+        max_backoff=WEB_MAX_BACKOFF,
         on_wait=_on_wait,
     )
     payload = [s.to_dict() for s in stories]
@@ -175,18 +188,41 @@ def _stories_for_country(source: str, country: str, country_code: str,
 
     with _cache_lock:
         cached = _cache.get(key)
-        if cached and now - cached[0] < _CACHE_TTL:
+    if cached and now - cached[0] < _CACHE_TTL:
+        return cached[1]
+
+    # If this source has recently failed, don't repeat the slow failure for
+    # every click during the cooldown window; serve stale cache if we have
+    # any, otherwise raise so the client sees a clear error.
+    if now < _unhealthy_until.get(source, 0.0):
+        if cached and now - cached[0] < _STALE_TTL:
+            print(f"[{source}:{country}] cooldown active; serving stale "
+                  f"({len(cached[1])} stories)", file=sys.stderr, flush=True)
             return cached[1]
+        raise RuntimeError(
+            f"{source} is rate-limiting us; try again in a moment "
+            f"or switch the Source dropdown."
+        )
 
     with _source_locks[source]:
         # Re-check cache under lock; another thread may have filled it.
         with _cache_lock:
             cached = _cache.get(key)
-            if cached and time.time() - cached[0] < _CACHE_TTL:
-                return cached[1]
+        if cached and time.time() - cached[0] < _CACHE_TTL:
+            return cached[1]
 
-        payload = _FETCHERS[source](country, country_code, timespan,
-                                    max_records, domains=list(domains))
+        try:
+            payload = _FETCHERS[source](country, country_code, timespan,
+                                        max_records, domains=list(domains))
+        except Exception as exc:  # noqa: BLE001 - degrade to stale cache
+            _unhealthy_until[source] = time.time() + _UNHEALTHY_COOLDOWN
+            if cached and time.time() - cached[0] < _STALE_TTL:
+                print(f"[{source}:{country}] fetch failed ({exc}); "
+                      f"serving stale ({len(cached[1])} stories)",
+                      file=sys.stderr, flush=True)
+                return cached[1]
+            raise
+
         print(f"[{source}:{country}] returned {len(payload)} stories",
               file=sys.stderr, flush=True)
 

@@ -149,10 +149,12 @@ let currentAbort = null;
 // without requiring another click.
 let activeCountry = null;
 
-// Hard ceiling for a single news request. Slightly above the server's
-// retry budget (15s timeout x 2 retries + backoffs) so slow-but-successful
-// calls still make it through, but runaway hangs don't pin the UI.
-const CLIENT_TIMEOUT_MS = 45000;
+// Hard ceiling for a single news request. Sized just above the server's
+// retry budget (8s timeout + 1 retry + ~3s backoff + ~3s floor) so a
+// slow-but-successful call still makes it through, but runaway hangs
+// don't pin the UI. The server falls back to stale cache on failure,
+// so the user almost always sees stories before this fires.
+const CLIENT_TIMEOUT_MS = 25000;
 
 function getSource() {
   const el = document.getElementById("sourceSelect");
