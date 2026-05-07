@@ -33,7 +33,11 @@ GDELT_DOC_URL = "https://api.gdeltproject.org/api/v2/doc/doc"
 # minutes at a time. We enforce the floor locally (no matter how often
 # ``fetch_stories`` is called, or how often the script is re-invoked) and,
 # when a 429 slips through anyway, back off exponentially before retrying.
-MIN_REQUEST_INTERVAL = 6.0      # seconds between successive requests
+# 3s is below GDELT's documented ~5s floor, but the server-side cache plus
+# per-source serialization mean we rarely hit the upstream back-to-back; the
+# tighter floor keeps the UI responsive when a user clicks a few countries
+# in quick succession and they all miss the cache.
+MIN_REQUEST_INTERVAL = 3.0      # seconds between successive requests
 MAX_RETRIES = 6                 # total attempts on 429 / transient errors
 INITIAL_BACKOFF = 15.0          # first sleep on 429; doubles each retry
 MAX_BACKOFF = 120.0             # cap any single backoff at 2 minutes
@@ -173,14 +177,20 @@ def _parse_retry_after(header: str | None) -> float:
 def _throttled_get(url: str, timeout: float,
                    on_wait: Callable[[str], None] | None,
                    max_retries: int = MAX_RETRIES,
-                   initial_backoff: float = INITIAL_BACKOFF) -> bytes:
+                   initial_backoff: float = INITIAL_BACKOFF,
+                   max_backoff: float = MAX_BACKOFF) -> bytes:
     """Fetch ``url`` while honoring the cross-run request interval and
-    retrying on 429 / transient 5xx responses with exponential backoff."""
+    retrying on 429 / transient 5xx responses with exponential backoff.
+
+    ``max_backoff`` caps both the doubled backoff and any ``Retry-After``
+    guidance from the server. The web flow passes a tight cap (a few
+    seconds) so a slow rate-limit window doesn't pin the UI.
+    """
 
     req = urllib.request.Request(
         url, headers={"User-Agent": "gdelt-geotagger/1.0"}
     )
-    backoff = initial_backoff
+    backoff = min(initial_backoff, max_backoff)
     last_exc: Exception | None = None
 
     for attempt in range(1, max_retries + 1):
@@ -202,11 +212,13 @@ def _throttled_get(url: str, timeout: float,
             if exc.code == 429 or 500 <= exc.code < 600:
                 if attempt == max_retries:
                     break
-                # Prefer the server's Retry-After guidance if provided.
+                # Prefer the server's Retry-After guidance if provided, but
+                # never wait longer than ``max_backoff`` (web callers want to
+                # bail to stale-cache rather than block the UI).
                 retry_after = _parse_retry_after(
                     exc.headers.get("Retry-After") if exc.headers else None
                 )
-                delay = min(MAX_BACKOFF, max(backoff, retry_after))
+                delay = min(max_backoff, max(backoff, retry_after))
                 if on_wait is not None:
                     on_wait(f"HTTP {exc.code} Too Many Requests; "
                             f"waiting {delay:.0f}s "
@@ -215,7 +227,7 @@ def _throttled_get(url: str, timeout: float,
                 # Push the next floor-check forward so the post-backoff call
                 # is separated from the failure by the full delay.
                 _save_last_request_time(time.time())
-                backoff = min(MAX_BACKOFF, backoff * 2)
+                backoff = min(max_backoff, backoff * 2)
                 continue
             raise  # non-retryable HTTP error
         except urllib.error.URLError as exc:
@@ -225,7 +237,7 @@ def _throttled_get(url: str, timeout: float,
             if on_wait is not None:
                 on_wait(f"Network error; retrying in {backoff:.0f}s\u2026")
             _sleep_with_progress(backoff, on_wait)
-            backoff = min(MAX_BACKOFF, backoff * 2)
+            backoff = min(max_backoff, backoff * 2)
 
     raise RuntimeError(
         f"GDELT request failed after {max_retries} attempts: {last_exc}. "
@@ -243,6 +255,7 @@ def fetch_stories(
     on_wait: Callable[[str], None] | None = None,
     max_retries: int = MAX_RETRIES,
     initial_backoff: float = INITIAL_BACKOFF,
+    max_backoff: float = MAX_BACKOFF,
 ) -> list[Story]:
     """Query the GDELT DOC API and return geotagged ``Story`` records.
 
@@ -259,7 +272,8 @@ def fetch_stories(
     url = _build_query_url(query, max_records, timespan, mode)
     raw_bytes = _throttled_get(url, timeout, on_wait,
                                max_retries=max_retries,
-                               initial_backoff=initial_backoff)
+                               initial_backoff=initial_backoff,
+                               max_backoff=max_backoff)
     raw = raw_bytes.decode("utf-8", errors="replace")
 
     # GDELT returns a plain-text error message (not JSON) when the query is
