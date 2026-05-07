@@ -233,18 +233,24 @@ async function loadNewsFor(country) {
   }
 }
 
-window.onload = () => {
-  const countries = document.querySelectorAll("svg path");
-  countries.forEach(country => {
-    country.addEventListener("click", () => {
-      const info = resolveCountry(country);
-      if (!info.name) {
-        setStatus("Could not identify that country.");
-        return;
-      }
-      loadNewsFor(info);
+window.addEventListener("load", () => {
+  // The better_overview map has its own click handler (two-country
+  // selection + arc), and calls loadNewsFor() directly for the first
+  // pick. Detect that page by its #selectionBox element and skip the
+  // auto click-binding so we don't fetch news for the second country.
+  if (!document.getElementById("selectionBox")) {
+    const countries = document.querySelectorAll("svg path");
+    countries.forEach(country => {
+      country.addEventListener("click", () => {
+        const info = resolveCountry(country);
+        if (!info.name) {
+          setStatus("Could not identify that country.");
+          return;
+        }
+        loadNewsFor(info);
+      });
     });
-  });
+  }
 
   // Re-fetch when the user changes source or timespan, as long as we have
   // a country selected.
@@ -256,4 +262,4 @@ window.onload = () => {
       });
     }
   }
-};
+});

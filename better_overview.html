@@ -6,14 +6,77 @@
     body {
       font-family: Arial;
       text-align: center;
+      margin: 0;
+      background: #fafafa;
+    }
+    h2 { margin: 16px 0 8px; }
+    .layout {
+      display: flex;
+      gap: 16px;
+      padding: 0 16px 16px;
+      align-items: flex-start;
+    }
+    .leftCol {
+      flex: 1 1 auto;
+      min-width: 0;
     }
     #map {
-      width: 90%;
+      width: 100%;
       margin: auto;
     }
     svg {
       width: 100%;
       max-width: 1000px;
+    }
+    #newsPanel {
+      flex: 0 0 360px;
+      max-height: 90vh;
+      overflow-y: auto;
+      background: #fff;
+      border: 1px solid #e0e0e0;
+      border-radius: 8px;
+      padding: 16px;
+      box-shadow: 0 1px 3px rgba(0, 0, 0, 0.06);
+      position: sticky;
+      top: 16px;
+      text-align: left;
+    }
+    #newsPanel h3 { margin: 0 0 8px; font-size: 18px; }
+    .news-controls {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 10px;
+      font-size: 13px;
+      color: #555;
+    }
+    .news-controls select { font-size: 13px; padding: 2px 4px; }
+    #newsStatus {
+      font-size: 13px;
+      color: #666;
+      margin-bottom: 8px;
+      min-height: 1em;
+    }
+    #newsList { list-style: none; padding: 0; margin: 0; }
+    .news-item { padding: 10px 0; border-bottom: 1px solid #eee; }
+    .news-item:last-child { border-bottom: none; }
+    .news-title {
+      color: #1a4fb5;
+      text-decoration: none;
+      font-weight: 600;
+      line-height: 1.3;
+      display: block;
+    }
+    .news-title:hover { text-decoration: underline; }
+    .news-meta { font-size: 12px; color: #777; margin-top: 4px; }
+    #countryName {
+      margin-top: 12px;
+      font-size: 22px;
+      font-weight: bold;
+    }
+    @media (max-width: 900px) {
+      .layout { flex-direction: column; }
+      #newsPanel { flex: 1 1 auto; width: auto; position: static; max-height: none; }
     }
     svg path {
       fill: lightgray;
@@ -74,6 +137,8 @@
 
 <h2>Select 2 Countries</h2>
 
+<div class="layout">
+<div class="leftCol">
 <div id="map">
   <!-- PASTE YOUR SVG MAP HERE -->
    <?xml version="1.0" encoding="UTF-8"?>
@@ -354,6 +419,42 @@
   <p>Country 2: <span id="country2">None</span></p>
   <button onclick="resetSelection()">Reset</button>
 </div>
+<div id="countryName">Click a country</div>
+</div>
+
+<aside id="newsPanel">
+  <h3>Country News</h3>
+  <div class="news-controls">
+    <label for="sourceSelect">Source</label>
+    <select id="sourceSelect">
+      <option value="gdelt" selected>GDELT</option>
+      <option value="freenewsapi">FreeNewsApi</option>
+    </select>
+  </div>
+  <div class="news-controls">
+    <label for="timespanSelect">Last</label>
+    <select id="timespanSelect">
+      <option value="1h">1 hour</option>
+      <option value="6h">6 hours</option>
+      <option value="24h" selected>24 hours</option>
+      <option value="3d">3 days</option>
+      <option value="7d">7 days</option>
+    </select>
+  </div>
+  <div class="news-controls">
+    <label for="trustedToggle">
+      <input type="checkbox" id="trustedToggle" checked>
+      Trusted sources only
+    </label>
+  </div>
+  <div id="newsStatus">Click a country on the map to load stories.</div>
+  <ul id="newsList"></ul>
+</aside>
+
+</div>
+
+<script src="trustedsources.js"></script>
+<script src="script.js"></script>
 
 <script>
 // -----------------------------
@@ -434,6 +535,15 @@ function handleClick(region, point) {
   const slot = selectedCountries.length === 1 ? "country1" : "country2";
   document.getElementById(slot).innerText = code;
 
+  // News only loads for the FIRST country picked. The second pick is
+  // used for the arc-overlay only — no extra news fetch.
+  if (selectedCountries.length === 1 && typeof window.loadNewsFor === "function") {
+    const info = (typeof window.resolveCountry === "function")
+      ? window.resolveCountry(region)
+      : { name: region.getAttribute("title") || code, code };
+    window.loadNewsFor(info);
+  }
+
   if (selectedCountries.length === 2) {
     drawArc(clickPoints[0], clickPoints[1]);
   }
@@ -451,6 +561,13 @@ function resetSelection() {
 
   document.getElementById("country1").innerText = "None";
   document.getElementById("country2").innerText = "None";
+
+  const newsList = document.getElementById("newsList");
+  if (newsList) newsList.innerHTML = "";
+  const newsStatus = document.getElementById("newsStatus");
+  if (newsStatus) newsStatus.textContent = "Click a country on the map to load stories.";
+  const cn = document.getElementById("countryName");
+  if (cn) cn.textContent = "Click a country";
 
   clearArc();
 }
