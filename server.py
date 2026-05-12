@@ -178,12 +178,29 @@ _FETCHERS = {
     "freenewsapi": _fetch_freenewsapi,
 }
 
+# Per-source fallback order. If the user-selected source is unhealthy or
+# the live fetch fails, we try the next entry before giving up. This is
+# what keeps the UI usable when GDELT is in a multi-minute 429 window.
+_FALLBACK_CHAIN = {
+    "gdelt": ["gdelt", "freenewsapi"],
+    "freenewsapi": ["freenewsapi", "gdelt"],
+}
 
-def _stories_for_country(source: str, country: str, country_code: str,
-                         timespan: str, max_records: int,
-                         domains: tuple[str, ...] = ()) -> list[dict]:
+
+def _try_fetch_one(source: str, country: str, country_code: str,
+                   timespan: str, max_records: int,
+                   domains: tuple[str, ...]) -> list[dict] | None:
+    """Attempt one source. Returns the payload on success, the most recent
+    cached payload (fresh or stale) on failure, or ``None`` when neither is
+    available (so the caller can try the next source in the chain).
+
+    Mutates ``_cache`` and ``_unhealthy_until`` as side effects.
+    """
+    # GDELT-only flags don't apply to FreeNewsApi, so don't let them split
+    # the cache key for FreeNewsApi.
+    effective_domains = domains if source == "gdelt" else ()
     key = (source, country.lower(), country_code.lower(), timespan,
-           max_records, domains)
+           max_records, effective_domains)
     now = time.time()
 
     with _cache_lock:
@@ -191,21 +208,15 @@ def _stories_for_country(source: str, country: str, country_code: str,
     if cached and now - cached[0] < _CACHE_TTL:
         return cached[1]
 
-    # If this source has recently failed, don't repeat the slow failure for
-    # every click during the cooldown window; serve stale cache if we have
-    # any, otherwise raise so the client sees a clear error.
+    # In cooldown — don't bother hitting the upstream; degrade to stale.
     if now < _unhealthy_until.get(source, 0.0):
         if cached and now - cached[0] < _STALE_TTL:
             print(f"[{source}:{country}] cooldown active; serving stale "
                   f"({len(cached[1])} stories)", file=sys.stderr, flush=True)
             return cached[1]
-        raise RuntimeError(
-            f"{source} is rate-limiting us; try again in a moment "
-            f"or switch the Source dropdown."
-        )
+        return None
 
     with _source_locks[source]:
-        # Re-check cache under lock; another thread may have filled it.
         with _cache_lock:
             cached = _cache.get(key)
         if cached and time.time() - cached[0] < _CACHE_TTL:
@@ -213,22 +224,41 @@ def _stories_for_country(source: str, country: str, country_code: str,
 
         try:
             payload = _FETCHERS[source](country, country_code, timespan,
-                                        max_records, domains=list(domains))
-        except Exception as exc:  # noqa: BLE001 - degrade to stale cache
+                                        max_records,
+                                        domains=list(effective_domains))
+        except Exception as exc:  # noqa: BLE001 - try the fallback
             _unhealthy_until[source] = time.time() + _UNHEALTHY_COOLDOWN
+            print(f"[{source}:{country}] fetch failed ({exc})",
+                  file=sys.stderr, flush=True)
             if cached and time.time() - cached[0] < _STALE_TTL:
-                print(f"[{source}:{country}] fetch failed ({exc}); "
-                      f"serving stale ({len(cached[1])} stories)",
+                print(f"[{source}:{country}] serving stale "
+                      f"({len(cached[1])} stories)",
                       file=sys.stderr, flush=True)
                 return cached[1]
-            raise
+            return None
 
         print(f"[{source}:{country}] returned {len(payload)} stories",
               file=sys.stderr, flush=True)
-
         with _cache_lock:
             _cache[key] = (time.time(), payload)
         return payload
+
+
+def _stories_for_country(source: str, country: str, country_code: str,
+                         timespan: str, max_records: int,
+                         domains: tuple[str, ...] = ()) -> list[dict]:
+    chain = _FALLBACK_CHAIN.get(source, [source])
+    for candidate in chain:
+        result = _try_fetch_one(candidate, country, country_code, timespan,
+                                max_records, domains)
+        if result is not None:
+            if candidate != source:
+                print(f"[{source}:{country}] fell back to {candidate}",
+                      file=sys.stderr, flush=True)
+            return result
+    raise RuntimeError(
+        "All news sources are unavailable right now; try again shortly."
+    )
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -285,7 +315,7 @@ class Handler(BaseHTTPRequestHandler):
         country = (params.get("country") or [""])[0].strip()
         country_code = (params.get("country_code") or [""])[0].strip()
         timespan = (params.get("timespan") or ["24h"])[0].strip() or "24h"
-        source = (params.get("source") or ["gdelt"])[0].strip().lower() or "gdelt"
+        source = (params.get("source") or ["freenewsapi"])[0].strip().lower() or "freenewsapi"
         try:
             max_records = int((params.get("max") or ["50"])[0])
         except ValueError:
