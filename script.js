@@ -150,11 +150,11 @@ let currentAbort = null;
 let activeCountry = null;
 
 // Hard ceiling for a single news request. Sized just above the server's
-// retry budget (8s timeout + 1 retry + ~3s backoff + ~3s floor) so a
-// slow-but-successful call still makes it through, but runaway hangs
-// don't pin the UI. The server falls back to stale cache on failure,
-// so the user almost always sees stories before this fires.
-const CLIENT_TIMEOUT_MS = 25000;
+// retry budget (18s timeout + 3 retries + ~30s of progressive backoff)
+// so a slow-but-successful GDELT call still makes it through, but
+// runaway hangs don't pin the UI. The server falls back to stale cache
+// or to FreeNewsApi only when GDELT really has nothing to give us.
+const CLIENT_TIMEOUT_MS = 90000;
 
 function getSource() {
   const el = document.getElementById("sourceSelect");
@@ -209,7 +209,7 @@ async function loadNewsFor(country) {
       country_code: country.code || "",
       source,
       timespan,
-      max: "50",
+      max: "75",
     });
     if (trustedDomains) params.set("domains", trustedDomains.join(","));
     const resp = await fetch(`/api/news?${params}`, { signal: controller.signal });
