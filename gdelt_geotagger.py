@@ -33,11 +33,10 @@ GDELT_DOC_URL = "https://api.gdeltproject.org/api/v2/doc/doc"
 # minutes at a time. We enforce the floor locally (no matter how often
 # ``fetch_stories`` is called, or how often the script is re-invoked) and,
 # when a 429 slips through anyway, back off exponentially before retrying.
-# 3s is below GDELT's documented ~5s floor, but the server-side cache plus
-# per-source serialization mean we rarely hit the upstream back-to-back; the
-# tighter floor keeps the UI responsive when a user clicks a few countries
-# in quick succession and they all miss the cache.
-MIN_REQUEST_INTERVAL = 3.0      # seconds between successive requests
+# Honor GDELT's documented floor — going below it costs us more in 429 wait
+# time than it saves in latency. The server uses an in-process cache and a
+# background prefetcher so this floor rarely fires for a real user click.
+MIN_REQUEST_INTERVAL = 5.0      # seconds between successive requests
 MAX_RETRIES = 6                 # total attempts on 429 / transient errors
 INITIAL_BACKOFF = 15.0          # first sleep on 429; doubles each retry
 MAX_BACKOFF = 120.0             # cap any single backoff at 2 minutes
