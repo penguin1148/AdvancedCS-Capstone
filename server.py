@@ -315,7 +315,7 @@ class Handler(BaseHTTPRequestHandler):
         country = (params.get("country") or [""])[0].strip()
         country_code = (params.get("country_code") or [""])[0].strip()
         timespan = (params.get("timespan") or ["24h"])[0].strip() or "24h"
-        source = (params.get("source") or ["freenewsapi"])[0].strip().lower() or "freenewsapi"
+        source = (params.get("source") or ["gdelt"])[0].strip().lower() or "gdelt"
         try:
             max_records = int((params.get("max") or ["50"])[0])
         except ValueError:
@@ -361,9 +361,52 @@ class Handler(BaseHTTPRequestHandler):
         })
 
 
+# Countries most users click first. The background prefetcher quietly keeps
+# their GDELT cache entries warm so the click path almost always hits the
+# 30-min in-memory cache instead of waiting on a live GDELT request.
+POPULAR_COUNTRIES: tuple[tuple[str, str], ...] = (
+    ("United States", "US"), ("United Kingdom", "GB"), ("China", "CN"),
+    ("Russia", "RU"), ("France", "FR"), ("Germany", "DE"),
+    ("India", "IN"), ("Brazil", "BR"), ("Japan", "JP"),
+    ("Canada", "CA"), ("Australia", "AU"), ("Mexico", "MX"),
+    ("Italy", "IT"), ("Spain", "ES"), ("Republic of Korea", "KR"),
+    ("Indonesia", "ID"), ("Turkey", "TR"), ("Saudi Arabia", "SA"),
+    ("Egypt", "EG"), ("South Africa", "ZA"), ("Nigeria", "NG"),
+    ("Argentina", "AR"), ("Iran", "IR"), ("Israel", "IL"),
+    ("Ukraine", "UA"), ("Poland", "PL"), ("Netherlands", "NL"),
+    ("Sweden", "SE"), ("Pakistan", "PK"), ("Vietnam", "VN"),
+)
+
+
+def _prefetch_loop() -> None:
+    """Rotate through POPULAR_COUNTRIES forever, asking the cache layer for
+    each one. Because ``_stories_for_country`` returns instantly when fresh,
+    real upstream hits only happen as entries near the 30-min TTL — i.e.
+    once every few minutes overall — so the 5s GDELT floor naturally paces
+    us without us having to manage timing here.
+    """
+    import itertools
+    # Brief warm-up so the HTTP server is responsive before we start
+    # competing for the GDELT lock.
+    time.sleep(5.0)
+    for name, code in itertools.cycle(POPULAR_COUNTRIES):
+        try:
+            _stories_for_country("gdelt", name, code, "24h", 50, domains=())
+        except Exception as exc:  # noqa: BLE001 - never let the worker die
+            print(f"[prefetch] {name}: {exc}", file=sys.stderr, flush=True)
+        # Small idle gap so a user click can interleave between cycles.
+        time.sleep(1.0)
+
+
 def main(host: str = "127.0.0.1", port: int = 8000) -> None:
     server = ThreadingHTTPServer((host, port), Handler)
+    prefetch_thread = threading.Thread(
+        target=_prefetch_loop, name="gdelt-prefetch", daemon=True,
+    )
+    prefetch_thread.start()
     print(f"Serving on http://{host}:{port}/  (Ctrl-C to stop)")
+    print(f"Prefetching GDELT cache for {len(POPULAR_COUNTRIES)} popular "
+          f"countries in the background.")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
