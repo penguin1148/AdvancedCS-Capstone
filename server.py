@@ -31,19 +31,22 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import freenewsapi
 from gdelt_geotagger import fetch_stories as gdelt_fetch_stories
 
-# Web UX tolerates much less patience than the CLI. Fail fast so the browser
-# can show an error (or stale cached data) instead of hanging on a retry loop.
-WEB_TIMEOUT = 8.0           # per-request HTTP timeout
-WEB_MAX_RETRIES = 1         # total attempts on 429 / network errors
-WEB_INITIAL_BACKOFF = 1.0   # first retry delay; doubles up to WEB_MAX_BACKOFF
-WEB_MAX_BACKOFF = 3.0       # never wait more than this between web retries
+# GDELT is the user's preferred source, so be patient with it: a single 429
+# should not knock us straight into the FreeNewsApi fallback. We give it a
+# reasonable timeout and multiple retries with progressive backoff so
+# transient rate-limit windows ride themselves out.
+WEB_TIMEOUT = 18.0          # per-request HTTP timeout
+WEB_MAX_RETRIES = 3         # total attempts on 429 / network errors
+WEB_INITIAL_BACKOFF = 3.0   # first retry delay; doubles up to WEB_MAX_BACKOFF
+WEB_MAX_BACKOFF = 12.0      # cap any single backoff at this many seconds
 
 VALID_SOURCES = {"gdelt", "freenewsapi"}
 
-# When an upstream returns 429 / errors out, mark it unhealthy for this long
-# so the next request goes straight to the stale cache instead of repeating
-# the same slow failure.
-_UNHEALTHY_COOLDOWN = 90.0
+# When an upstream returns 429 / errors out *after* exhausting retries, mark
+# it unhealthy for this long so the next request goes to the fallback (or
+# stale cache) instead of repeating the same slow failure. Short enough that
+# we recover within a click or two once the rate-limit window expires.
+_UNHEALTHY_COOLDOWN = 15.0
 _unhealthy_until: dict[str, float] = {"gdelt": 0.0, "freenewsapi": 0.0}
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -119,16 +122,47 @@ def _balance_by_domain(stories: list[dict], domains: list[str],
     return out
 
 
+def _balance_generically(stories: list[dict], max_records: int) -> list[dict]:
+    """Round-robin across whichever domains showed up in the response.
+
+    GDELT keyword searches frequently return ~20 near-duplicates of the same
+    wire story from a single publisher. Bucketing by domain and rotating
+    through them gives the user a more diverse mix without any allowlist
+    configured.
+    """
+    buckets: dict[str, list[dict]] = {}
+    order: list[str] = []  # preserve first-seen order so results stay stable
+    for story in stories:
+        d = (story.get("domain") or "_").lower()
+        if d not in buckets:
+            buckets[d] = []
+            order.append(d)
+        buckets[d].append(story)
+
+    out: list[dict] = []
+    while len(out) < max_records:
+        progress = False
+        for d in order:
+            if buckets[d]:
+                out.append(buckets[d].pop(0))
+                progress = True
+                if len(out) >= max_records:
+                    break
+        if not progress:
+            break
+    return out
+
+
 def _fetch_gdelt(country: str, country_code: str, timespan: str,
                  max_records: int,
                  domains: list[str] | None = None) -> list[dict]:
     def _on_wait(msg: str) -> None:
         print(f"[gdelt:{country}] {msg}", file=sys.stderr, flush=True)
 
-    # When restricting to a trusted-domain allowlist, pull a much larger
-    # upstream pool (GDELT caps at 250) so each publisher has enough stories
-    # to contribute when we round-robin them into a balanced result.
-    upstream_max = 250 if domains else max_records
+    # Always pull a generous upstream pool (GDELT caps at 250) so we can
+    # round-robin publishers into a diverse result, even when the user has
+    # not configured a trusted-domains allowlist.
+    upstream_max = 250
     print(f"[gdelt:{country}] fetching (timespan={timespan}, "
           f"upstream_max={upstream_max}, return_max={max_records}, "
           f"domains={domains or '-'})", file=sys.stderr, flush=True)
@@ -144,8 +178,8 @@ def _fetch_gdelt(country: str, country_code: str, timespan: str,
     )
     payload = [s.to_dict() for s in stories]
     if domains:
-        payload = _balance_by_domain(payload, domains, max_records)
-    return payload
+        return _balance_by_domain(payload, domains, max_records)
+    return _balance_generically(payload, max_records)
 
 
 def _fetch_freenewsapi(country: str, country_code: str, timespan: str,
@@ -378,24 +412,58 @@ POPULAR_COUNTRIES: tuple[tuple[str, str], ...] = (
 )
 
 
+# The user click sends max=75 (see script.js). The prefetcher uses the same
+# value so its cache entries are keyed identically and the click lands on a
+# direct cache hit.
+_PREFETCH_MAX = 75
+_PREFETCH_TIMESPAN = "24h"
+
+
+def _prefetch_one(name: str, code: str) -> None:
+    """Refresh the GDELT cache entry for one country without touching the
+    cooldown machinery. A prefetch 429 must never poison a user click — if
+    GDELT pushes back, we just skip this country and try the next one.
+    """
+    key = ("gdelt", name.lower(), code.lower(), _PREFETCH_TIMESPAN,
+           _PREFETCH_MAX, ())
+    with _cache_lock:
+        cached = _cache.get(key)
+    if cached and time.time() - cached[0] < _CACHE_TTL:
+        return  # still fresh; nothing to do
+
+    with _source_locks["gdelt"]:
+        # Re-check under lock; a concurrent user click may have just filled it.
+        with _cache_lock:
+            cached = _cache.get(key)
+        if cached and time.time() - cached[0] < _CACHE_TTL:
+            return
+
+        try:
+            payload = _fetch_gdelt(name, code, _PREFETCH_TIMESPAN,
+                                   _PREFETCH_MAX, domains=[])
+        except Exception as exc:  # noqa: BLE001 - prefetch is best-effort
+            print(f"[prefetch:{name}] {exc}", file=sys.stderr, flush=True)
+            return
+
+        with _cache_lock:
+            _cache[key] = (time.time(), payload)
+        print(f"[prefetch:{name}] warmed cache ({len(payload)} stories)",
+              file=sys.stderr, flush=True)
+
+
 def _prefetch_loop() -> None:
-    """Rotate through POPULAR_COUNTRIES forever, asking the cache layer for
-    each one. Because ``_stories_for_country`` returns instantly when fresh,
-    real upstream hits only happen as entries near the 30-min TTL — i.e.
-    once every few minutes overall — so the 5s GDELT floor naturally paces
-    us without us having to manage timing here.
+    """Rotate through POPULAR_COUNTRIES forever, refreshing entries that have
+    expired. Sleeps generously between countries so the prefetcher doesn't
+    contribute to GDELT's perception of us as a hot caller — we'd rather take
+    half an hour to fully warm the cache than get the IP rate-limited.
     """
     import itertools
-    # Brief warm-up so the HTTP server is responsive before we start
-    # competing for the GDELT lock.
-    time.sleep(5.0)
+    time.sleep(10.0)  # let the HTTP server settle first
     for name, code in itertools.cycle(POPULAR_COUNTRIES):
-        try:
-            _stories_for_country("gdelt", name, code, "24h", 50, domains=())
-        except Exception as exc:  # noqa: BLE001 - never let the worker die
-            print(f"[prefetch] {name}: {exc}", file=sys.stderr, flush=True)
-        # Small idle gap so a user click can interleave between cycles.
-        time.sleep(1.0)
+        _prefetch_one(name, code)
+        # ~10s between iterations keeps us well under GDELT's per-IP load
+        # threshold, and yields the lock so user clicks always win the race.
+        time.sleep(10.0)
 
 
 def main(host: str = "127.0.0.1", port: int = 8000) -> None:
