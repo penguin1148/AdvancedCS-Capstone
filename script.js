@@ -112,12 +112,18 @@ function renderStories(stories, opts) {
   }
 
   const noun = stories.length === 1 ? "story" : "stories";
+  const translatedNote = info.translated ? " (translated)" : "";
   if (info.trusted) {
-    setStatus(`${stories.length} trusted ${noun} via ${getSource()}.`);
+    setStatus(`${stories.length} trusted ${noun} via ${getSource()}${translatedNote}.`);
   } else {
-    setStatus(`${stories.length} recent ${noun} via ${getSource()}.`);
+    setStatus(`${stories.length} recent ${noun} via ${getSource()}${translatedNote}.`);
+  }
+  if (info.translateError) {
+    setStatus(`${stories.length} ${noun} via ${getSource()}. ` +
+              `Translation skipped: ${info.translateError}`);
   }
 
+  const showTranslated = !!info.translated;
   for (const s of stories) {
     const li = document.createElement("li");
     li.className = "news-item";
@@ -126,8 +132,28 @@ function renderStories(stories, opts) {
     a.href = s.url;
     a.target = "_blank";
     a.rel = "noopener noreferrer";
-    a.textContent = s.title || "(untitled)";
+    const original = s.title || "(untitled)";
+    const translated = s.translated_title || "";
+    const hasUsefulTranslation = showTranslated && translated &&
+                                 translated.trim() !== original.trim();
+    a.textContent = hasUsefulTranslation ? translated : original;
     a.className = "news-title";
+
+    li.appendChild(a);
+
+    // Surface the original headline beneath the translation so readers can
+    // verify the wording, and so non-English speakers can still match it
+    // against their source.
+    if (hasUsefulTranslation) {
+      const orig = document.createElement("div");
+      orig.className = "news-original";
+      orig.style.fontSize = "0.85em";
+      orig.style.opacity = "0.75";
+      orig.style.marginTop = "2px";
+      const lang = s.detected_language ? ` (${s.detected_language})` : "";
+      orig.textContent = `Original${lang}: ${original}`;
+      li.appendChild(orig);
+    }
 
     const meta = document.createElement("div");
     meta.className = "news-meta";
@@ -137,7 +163,6 @@ function renderStories(stories, opts) {
     if (s.seendate) pieces.push(formatSeenDate(s.seendate));
     meta.textContent = pieces.join("  \u00b7  ");
 
-    li.appendChild(a);
     li.appendChild(meta);
     list.appendChild(li);
   }
@@ -171,6 +196,11 @@ function isTrustedFilterOn() {
   return el ? el.checked : true;
 }
 
+function isTranslateOn() {
+  const el = document.getElementById("translateToggle");
+  return el ? el.checked : false;
+}
+
 async function loadNewsFor(country) {
   if (!country || !country.name) return;
   activeCountry = country;
@@ -201,7 +231,11 @@ async function loadNewsFor(country) {
               `Uncheck "Trusted sources only" to see all GDELT results.`);
     return;
   }
-  setStatus(`Loading news for ${country.name} via ${source}\u2026`);
+  const translateOn = isTranslateOn();
+  const loadingSuffix = translateOn
+    ? " (translating, this can take a moment)\u2026"
+    : "\u2026";
+  setStatus(`Loading news for ${country.name} via ${source}${loadingSuffix}`);
 
   try {
     const params = new URLSearchParams({
@@ -212,6 +246,7 @@ async function loadNewsFor(country) {
       max: "75",
     });
     if (trustedDomains) params.set("domains", trustedDomains.join(","));
+    if (translateOn) params.set("translate", "1");
     const resp = await fetch(`/api/news?${params}`, { signal: controller.signal });
     if (myRequest !== currentRequest) return;
 
@@ -220,7 +255,11 @@ async function loadNewsFor(country) {
       setStatus(`Error (${source}): ${data.error || resp.statusText}`);
       return;
     }
-    renderStories(data.stories || [], { trusted: !!trustedDomains });
+    renderStories(data.stories || [], {
+      trusted: !!trustedDomains,
+      translated: !!data.translated,
+      translateError: data.translate_error || null,
+    });
   } catch (err) {
     if (myRequest !== currentRequest) return;
     if (err && err.name === "AbortError") {
@@ -256,7 +295,7 @@ window.addEventListener("load", () => {
 
   // Re-fetch when the user changes source or timespan, as long as we have
   // a country selected.
-  for (const id of ["sourceSelect", "timespanSelect", "trustedToggle"]) {
+  for (const id of ["sourceSelect", "timespanSelect", "trustedToggle", "translateToggle"]) {
     const el = document.getElementById(id);
     if (el) {
       el.addEventListener("change", () => {

@@ -31,6 +31,18 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import freenewsapi
 from gdelt_geotagger import fetch_stories as gdelt_fetch_stories
 
+# Optional dependency. If deep-translator isn't installed we still serve news
+# without translation; the /api/news handler reports a clear error if the
+# user explicitly asked for translation but the dependency is missing.
+try:
+    from translate import detect_and_translate as _detect_and_translate
+    _TRANSLATE_AVAILABLE = True
+    _TRANSLATE_IMPORT_ERROR: str | None = None
+except Exception as _exc:  # noqa: BLE001 - any import failure disables the feature
+    _detect_and_translate = None  # type: ignore[assignment]
+    _TRANSLATE_AVAILABLE = False
+    _TRANSLATE_IMPORT_ERROR = str(_exc)
+
 # GDELT is the user's preferred source, so be patient with it: a single 429
 # should not knock us straight into the FreeNewsApi fallback. We give it a
 # reasonable timeout and multiple retries with progressive backoff so
@@ -73,6 +85,80 @@ _source_locks: dict[str, threading.Lock] = {
     "gdelt": threading.Lock(),
     "freenewsapi": threading.Lock(),
 }
+
+# Translation cache: titles repeat across requests (cached stories, popular
+# wire copy, prefetched countries), so memoizing keeps the slow path off the
+# hot path. Keyed by (title, target_lang) -> (translated_title, detected).
+_translate_cache: dict[tuple[str, str], tuple[str, str]] = {}
+_translate_cache_lock = threading.Lock()
+# Bound the cache so a long-running server doesn't grow unbounded as users
+# explore many countries; titles are short, so the limit is generous.
+_TRANSLATE_CACHE_MAX = 5000
+
+
+def _translate_one(title: str, target_lang: str) -> tuple[str, str]:
+    """Return (translated_title, detected_language) for a single title.
+
+    Cached so repeated lookups for the same headline are free. Errors fall
+    back to the original text with a 'unknown' language tag (matching
+    translate.detect_and_translate's own failure mode).
+    """
+    if not title or not title.strip():
+        return title, "unknown"
+
+    cache_key = (title, target_lang)
+    with _translate_cache_lock:
+        cached = _translate_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    try:
+        result = _detect_and_translate(title, target_language=target_lang)
+        out = (result.translated_title or title, result.detected_language)
+    except Exception as exc:  # noqa: BLE001 - never let translation kill a request
+        print(f"[translate] failed for title {title[:60]!r}: {exc}",
+              file=sys.stderr, flush=True)
+        out = (title, "unknown")
+
+    with _translate_cache_lock:
+        # Cheap LRU-ish trim: when full, drop an arbitrary entry. We don't
+        # need true LRU semantics here — the cache is best-effort.
+        if len(_translate_cache) >= _TRANSLATE_CACHE_MAX:
+            try:
+                _translate_cache.pop(next(iter(_translate_cache)))
+            except StopIteration:
+                pass
+        _translate_cache[cache_key] = out
+    return out
+
+
+def _translate_stories(stories: list[dict],
+                       target_lang: str = "en") -> list[dict]:
+    """Translate every story's title in parallel, attaching translated_title
+    and detected_language fields. Returns the same list with the dicts
+    mutated in place (and also returned for convenience).
+
+    Translation runs over a small thread pool: the Google endpoint is
+    network-bound, so a handful of concurrent requests cuts wall time from
+    "minutes" to a few seconds for a typical 75-story page. The translation
+    cache absorbs the cost on repeat views.
+    """
+    if not stories or not _TRANSLATE_AVAILABLE:
+        return stories
+
+    from concurrent.futures import ThreadPoolExecutor
+
+    titles = [s.get("title", "") or "" for s in stories]
+    # 6 workers: enough parallelism to mask network latency without looking
+    # like an abuser to the free Google endpoint.
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        results = list(pool.map(lambda t: _translate_one(t, target_lang),
+                                titles))
+
+    for story, (translated, detected) in zip(stories, results):
+        story["translated_title"] = translated
+        story["detected_language"] = detected
+    return stories
 
 
 def _build_gdelt_query(country: str, domains: list[str] | None = None) -> str:
@@ -364,6 +450,13 @@ class Handler(BaseHTTPRequestHandler):
             d.strip().lower() for d in raw_domains.split(",") if d.strip()
         )
 
+        # Optional translation of story titles. Accepts 1/true/yes/on; the
+        # target language defaults to English but can be overridden via
+        # ``target_lang`` (e.g. ``target_lang=es``) for future use.
+        translate_raw = (params.get("translate") or ["0"])[0].strip().lower()
+        want_translate = translate_raw in {"1", "true", "yes", "on"}
+        target_lang = (params.get("target_lang") or ["en"])[0].strip() or "en"
+
         if not country:
             self._send_json(400, {"error": "country parameter is required"})
             return
@@ -385,12 +478,31 @@ class Handler(BaseHTTPRequestHandler):
             })
             return
 
+        translated = False
+        translate_error: str | None = None
+        if want_translate:
+            if not _TRANSLATE_AVAILABLE:
+                translate_error = (
+                    "Translation unavailable: install deep-translator "
+                    f"(pip install deep-translator). [{_TRANSLATE_IMPORT_ERROR}]"
+                )
+            else:
+                # Copy each dict so we don't poison the shared cache with
+                # translation fields (which would otherwise stick around for
+                # subsequent untranslated requests).
+                stories = [dict(s) for s in stories]
+                _translate_stories(stories, target_lang=target_lang)
+                translated = True
+
         self._send_json(200, {
             "source": source,
             "country": country,
             "country_code": country_code,
             "timespan": timespan,
             "count": len(stories),
+            "translated": translated,
+            "target_lang": target_lang if translated else None,
+            "translate_error": translate_error,
             "stories": stories,
         })
 
