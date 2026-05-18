@@ -49,25 +49,37 @@ def detect_and_translate(
 
     try:
         translator = GoogleTranslator(source="auto", target=target_language)
-
         translated = translator.translate(text)
-
-        # deep-translator does not expose detection directly,
-        # so we do a lightweight detect call separately
-        detected = GoogleTranslator().detect(text)
-
-        return TranslatedHeadline(
-            original_title=text,
-            translated_title=translated,
-            detected_language=detected,
-        )
-
     except Exception:
         return TranslatedHeadline(
             original_title=text,
             translated_title=text,
             detected_language="unknown",
         )
+
+    # Language detection is best-effort — recent deep-translator releases
+    # have made GoogleTranslator().detect() unreliable, so a failure here
+    # must not throw away the successful translation above.
+    detected = "unknown"
+    try:
+        result = GoogleTranslator().detect(text)
+        if isinstance(result, (list, tuple)) and result:
+            detected = str(result[0])
+        elif result:
+            detected = str(result)
+    except Exception:
+        pass
+
+    # If the translator returned nothing useful, fall back to the original
+    # so the caller can still render something.
+    if not translated or not str(translated).strip():
+        translated = text
+
+    return TranslatedHeadline(
+        original_title=text,
+        translated_title=str(translated),
+        detected_language=detected,
+    )
 
 
 def translate_story_headlines(
