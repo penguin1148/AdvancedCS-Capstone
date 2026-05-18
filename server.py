@@ -109,7 +109,10 @@ def _translate_one(title: str, target_lang: str) -> tuple[str, str]:
     cache_key = (title, target_lang)
     with _translate_cache_lock:
         cached = _translate_cache.get(cache_key)
-    if cached is not None:
+    # Only trust a cache hit that actually produced a translation. A prior
+    # failed attempt (translated == original) shouldn't pin a headline to
+    # its untranslated form forever — retry on the next request.
+    if cached is not None and cached[0] and cached[0].strip() != title.strip():
         return cached
 
     try:
