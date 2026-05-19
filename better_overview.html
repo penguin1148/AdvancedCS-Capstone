@@ -28,8 +28,11 @@
       width: 100%;
       max-width: 1000px;
     }
-    #newsPanel {
-      flex: 0 0 360px;
+    /* Each news column is its own sticky panel; the controls live inside
+       the first one so they're visible without scrolling, and the second
+       column shows up only after the user picks a second country. */
+    .newsPanel {
+      flex: 0 0 320px;
       max-height: 90vh;
       overflow-y: auto;
       background: #fff;
@@ -41,7 +44,20 @@
       top: 16px;
       text-align: left;
     }
-    #newsPanel h3 { margin: 0 0 8px; font-size: 18px; }
+    .newsPanel.hidden { display: none; }
+    .newsPanel h3 {
+      margin: 0 0 4px;
+      font-size: 18px;
+      display: flex;
+      align-items: baseline;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .panelCountryName {
+      font-size: 14px;
+      font-weight: 500;
+      color: #1a4fb5;
+    }
     .news-controls {
       display: flex;
       align-items: center;
@@ -51,13 +67,13 @@
       color: #555;
     }
     .news-controls select { font-size: 13px; padding: 2px 4px; }
-    #newsStatus {
+    .newsPanel .news-status {
       font-size: 13px;
       color: #666;
       margin-bottom: 8px;
       min-height: 1em;
     }
-    #newsList { list-style: none; padding: 0; margin: 0; }
+    .newsPanel ul { list-style: none; padding: 0; margin: 0; }
     .news-item { padding: 10px 0; border-bottom: 1px solid #eee; }
     .news-item:last-child { border-bottom: none; }
     .news-title {
@@ -74,9 +90,9 @@
       font-size: 22px;
       font-weight: bold;
     }
-    @media (max-width: 900px) {
+    @media (max-width: 1100px) {
       .layout { flex-direction: column; }
-      #newsPanel { flex: 1 1 auto; width: auto; position: static; max-height: none; }
+      .newsPanel { flex: 1 1 auto; width: auto; position: static; max-height: none; }
     }
     svg path {
       fill: lightgray;
@@ -422,8 +438,8 @@
 <div id="countryName">Click a country</div>
 </div>
 
-<aside id="newsPanel">
-  <h3>Country News</h3>
+<aside id="newsPanel" class="newsPanel">
+  <h3>Country 1 News</h3>
   <div class="news-controls">
     <label for="sourceSelect">Source</label>
     <select id="sourceSelect">
@@ -453,8 +469,17 @@
       Translate headlines to English
     </label>
   </div>
-  <div id="newsStatus">Click a country on the map to load stories.</div>
+  <div id="newsStatus" class="news-status">Click a country on the map to load stories.</div>
   <ul id="newsList"></ul>
+</aside>
+
+<!-- Second news column: appears when the user picks a second country.
+     Has no controls of its own; the shared controls in the first panel
+     drive both columns. -->
+<aside id="newsPanel-1" class="newsPanel hidden">
+  <h3>Country 2 News <span class="panelCountryName" id="countryName-1"></span></h3>
+  <div id="newsStatus-1" class="news-status">Click a second country to load stories.</div>
+  <ul id="newsList-1"></ul>
 </aside>
 
 </div>
@@ -538,16 +563,23 @@ function handleClick(region, point) {
   const color = selectedCountries.length === 1 ? "lightblue" : "yellow";
   region.style.fill = color;
 
-  const slot = selectedCountries.length === 1 ? "country1" : "country2";
-  document.getElementById(slot).innerText = code;
+  // Pick number -> selection-box slot (1-indexed display) and news-panel
+  // slot (0-indexed). Each click loads news for its own country into its
+  // own column.
+  const pickIndex = selectedCountries.length - 1;  // 0 or 1
+  const labelEl = pickIndex === 0 ? "country1" : "country2";
+  document.getElementById(labelEl).innerText = code;
 
-  // News only loads for the FIRST country picked. The second pick is
-  // used for the arc-overlay only — no extra news fetch.
-  if (selectedCountries.length === 1 && typeof window.loadNewsFor === "function") {
+  if (typeof window.loadNewsFor === "function") {
     const info = (typeof window.resolveCountry === "function")
       ? window.resolveCountry(region)
       : { name: region.getAttribute("title") || code, code };
-    window.loadNewsFor(info);
+    if (pickIndex === 1) {
+      // Reveal the second column on the first time we use it.
+      const panel = document.getElementById("newsPanel-1");
+      if (panel) panel.classList.remove("hidden");
+    }
+    window.loadNewsFor(info, pickIndex);
   }
 
   if (selectedCountries.length === 2) {
@@ -568,10 +600,14 @@ function resetSelection() {
   document.getElementById("country1").innerText = "None";
   document.getElementById("country2").innerText = "None";
 
-  const newsList = document.getElementById("newsList");
-  if (newsList) newsList.innerHTML = "";
-  const newsStatus = document.getElementById("newsStatus");
-  if (newsStatus) newsStatus.textContent = "Click a country on the map to load stories.";
+  // Tear down both news columns (cancels any in-flight fetches, clears
+  // lists, restores the placeholder status).
+  if (typeof window.clearSlot === "function") {
+    window.clearSlot(0);
+    window.clearSlot(1);
+  }
+  const panel1 = document.getElementById("newsPanel-1");
+  if (panel1) panel1.classList.add("hidden");
   const cn = document.getElementById("countryName");
   if (cn) cn.textContent = "Click a country";
 
