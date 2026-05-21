@@ -31,11 +31,26 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import freenewsapi
 from gdelt_geotagger import fetch_stories as gdelt_fetch_stories
 
-# Web UX tolerates much less patience than the CLI. Fail fast so the browser
-# can show an error instead of hanging on a GDELT retry loop.
-WEB_TIMEOUT = 15.0          # per-request HTTP timeout
-WEB_MAX_RETRIES = 2         # total attempts on 429 / network errors
-WEB_INITIAL_BACKOFF = 4.0   # first retry delay; doubles up to MAX_BACKOFF
+# Optional dependency. If deep-translator isn't installed we still serve news
+# without translation; the /api/news handler reports a clear error if the
+# user explicitly asked for translation but the dependency is missing.
+try:
+    from translate import detect_and_translate as _detect_and_translate
+    _TRANSLATE_AVAILABLE = True
+    _TRANSLATE_IMPORT_ERROR: str | None = None
+except Exception as _exc:  # noqa: BLE001 - any import failure disables the feature
+    _detect_and_translate = None  # type: ignore[assignment]
+    _TRANSLATE_AVAILABLE = False
+    _TRANSLATE_IMPORT_ERROR = str(_exc)
+
+# GDELT is the user's preferred source, so be patient with it: a single 429
+# should not knock us straight into the FreeNewsApi fallback. We give it a
+# reasonable timeout and multiple retries with progressive backoff so
+# transient rate-limit windows ride themselves out.
+WEB_TIMEOUT = 18.0          # per-request HTTP timeout
+WEB_MAX_RETRIES = 3         # total attempts on 429 / network errors
+WEB_INITIAL_BACKOFF = 3.0   # first retry delay; doubles up to WEB_MAX_BACKOFF
+WEB_MAX_BACKOFF = 12.0      # cap any single backoff at this many seconds
 
 VALID_SOURCES = {"gdelt", "freenewsapi"}
 
@@ -45,16 +60,29 @@ COMPARE_MODEL = "claude-haiku-4-5"
 COMPARE_MAX_STORIES = 50      # cap per country to bound prompt size
 COMPARE_MAX_TOKENS = 1500
 
+# When an upstream returns 429 / errors out *after* exhausting retries, mark
+# it unhealthy for this long so the next request goes to the fallback (or
+# stale cache) instead of repeating the same slow failure. Short enough that
+# we recover within a click or two once the rate-limit window expires.
+_UNHEALTHY_COOLDOWN = 15.0
+_unhealthy_until: dict[str, float] = {"gdelt": 0.0, "freenewsapi": 0.0}
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 STATIC_FILES = {
-    "/": ("overview.html", "text/html; charset=utf-8"),
+    "/": ("better_overview.html", "text/html; charset=utf-8"),
+    "/better_overview.html": ("better_overview.html", "text/html; charset=utf-8"),
     "/overview.html": ("overview.html", "text/html; charset=utf-8"),
     "/script.js": ("script.js", "application/javascript; charset=utf-8"),
     "/trustedsources.js": ("trustedsources.js", "application/javascript; charset=utf-8"),
 }
 
-# Cache responses for a short window. Keyed by (source, country, code, timespan, max).
-_CACHE_TTL = 120.0  # seconds
+# Cache responses. The fresh window is what we serve without re-querying;
+# the stale window is a fallback we serve when the upstream errors out so
+# the user always sees stories instead of a red error message. The user has
+# explicitly opted in to "not the very latest news" in exchange for speed,
+# so these are sized aggressively.
+_CACHE_TTL = 1800.0   # 30 min: fresh enough, fast enough
+_STALE_TTL = 21600.0  # 6 hours: served only when a refetch fails
 _cache: dict[tuple, tuple[float, list[dict]]] = {}
 _cache_lock = threading.Lock()
 # Serialize GDELT requests so concurrent clicks don't trip the rate limiter.
@@ -63,6 +91,83 @@ _source_locks: dict[str, threading.Lock] = {
     "gdelt": threading.Lock(),
     "freenewsapi": threading.Lock(),
 }
+
+# Translation cache: titles repeat across requests (cached stories, popular
+# wire copy, prefetched countries), so memoizing keeps the slow path off the
+# hot path. Keyed by (title, target_lang) -> (translated_title, detected).
+_translate_cache: dict[tuple[str, str], tuple[str, str]] = {}
+_translate_cache_lock = threading.Lock()
+# Bound the cache so a long-running server doesn't grow unbounded as users
+# explore many countries; titles are short, so the limit is generous.
+_TRANSLATE_CACHE_MAX = 5000
+
+
+def _translate_one(title: str, target_lang: str) -> tuple[str, str]:
+    """Return (translated_title, detected_language) for a single title.
+
+    Cached so repeated lookups for the same headline are free. Errors fall
+    back to the original text with a 'unknown' language tag (matching
+    translate.detect_and_translate's own failure mode).
+    """
+    if not title or not title.strip():
+        return title, "unknown"
+
+    cache_key = (title, target_lang)
+    with _translate_cache_lock:
+        cached = _translate_cache.get(cache_key)
+    # Only trust a cache hit that actually produced a translation. A prior
+    # failed attempt (translated == original) shouldn't pin a headline to
+    # its untranslated form forever — retry on the next request.
+    if cached is not None and cached[0] and cached[0].strip() != title.strip():
+        return cached
+
+    try:
+        result = _detect_and_translate(title, target_language=target_lang)
+        out = (result.translated_title or title, result.detected_language)
+    except Exception as exc:  # noqa: BLE001 - never let translation kill a request
+        print(f"[translate] failed for title {title[:60]!r}: {exc}",
+              file=sys.stderr, flush=True)
+        out = (title, "unknown")
+
+    with _translate_cache_lock:
+        # Cheap LRU-ish trim: when full, drop an arbitrary entry. We don't
+        # need true LRU semantics here — the cache is best-effort.
+        if len(_translate_cache) >= _TRANSLATE_CACHE_MAX:
+            try:
+                _translate_cache.pop(next(iter(_translate_cache)))
+            except StopIteration:
+                pass
+        _translate_cache[cache_key] = out
+    return out
+
+
+def _translate_stories(stories: list[dict],
+                       target_lang: str = "en") -> list[dict]:
+    """Translate every story's title in parallel, attaching translated_title
+    and detected_language fields. Returns the same list with the dicts
+    mutated in place (and also returned for convenience).
+
+    Translation runs over a small thread pool: the Google endpoint is
+    network-bound, so a handful of concurrent requests cuts wall time from
+    "minutes" to a few seconds for a typical 75-story page. The translation
+    cache absorbs the cost on repeat views.
+    """
+    if not stories or not _TRANSLATE_AVAILABLE:
+        return stories
+
+    from concurrent.futures import ThreadPoolExecutor
+
+    titles = [s.get("title", "") or "" for s in stories]
+    # 6 workers: enough parallelism to mask network latency without looking
+    # like an abuser to the free Google endpoint.
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        results = list(pool.map(lambda t: _translate_one(t, target_lang),
+                                titles))
+
+    for story, (translated, detected) in zip(stories, results):
+        story["translated_title"] = translated
+        story["detected_language"] = detected
+    return stories
 
 
 def _build_gdelt_query(country: str, domains: list[str] | None = None) -> str:
@@ -112,16 +217,47 @@ def _balance_by_domain(stories: list[dict], domains: list[str],
     return out
 
 
+def _balance_generically(stories: list[dict], max_records: int) -> list[dict]:
+    """Round-robin across whichever domains showed up in the response.
+
+    GDELT keyword searches frequently return ~20 near-duplicates of the same
+    wire story from a single publisher. Bucketing by domain and rotating
+    through them gives the user a more diverse mix without any allowlist
+    configured.
+    """
+    buckets: dict[str, list[dict]] = {}
+    order: list[str] = []  # preserve first-seen order so results stay stable
+    for story in stories:
+        d = (story.get("domain") or "_").lower()
+        if d not in buckets:
+            buckets[d] = []
+            order.append(d)
+        buckets[d].append(story)
+
+    out: list[dict] = []
+    while len(out) < max_records:
+        progress = False
+        for d in order:
+            if buckets[d]:
+                out.append(buckets[d].pop(0))
+                progress = True
+                if len(out) >= max_records:
+                    break
+        if not progress:
+            break
+    return out
+
+
 def _fetch_gdelt(country: str, country_code: str, timespan: str,
                  max_records: int,
                  domains: list[str] | None = None) -> list[dict]:
     def _on_wait(msg: str) -> None:
         print(f"[gdelt:{country}] {msg}", file=sys.stderr, flush=True)
 
-    # When restricting to a trusted-domain allowlist, pull a much larger
-    # upstream pool (GDELT caps at 250) so each publisher has enough stories
-    # to contribute when we round-robin them into a balanced result.
-    upstream_max = 250 if domains else max_records
+    # Always pull a generous upstream pool (GDELT caps at 250) so we can
+    # round-robin publishers into a diverse result, even when the user has
+    # not configured a trusted-domains allowlist.
+    upstream_max = 250
     print(f"[gdelt:{country}] fetching (timespan={timespan}, "
           f"upstream_max={upstream_max}, return_max={max_records}, "
           f"domains={domains or '-'})", file=sys.stderr, flush=True)
@@ -132,12 +268,13 @@ def _fetch_gdelt(country: str, country_code: str, timespan: str,
         timeout=WEB_TIMEOUT,
         max_retries=WEB_MAX_RETRIES,
         initial_backoff=WEB_INITIAL_BACKOFF,
+        max_backoff=WEB_MAX_BACKOFF,
         on_wait=_on_wait,
     )
     payload = [s.to_dict() for s in stories]
     if domains:
-        payload = _balance_by_domain(payload, domains, max_records)
-    return payload
+        return _balance_by_domain(payload, domains, max_records)
+    return _balance_generically(payload, max_records)
 
 
 def _fetch_freenewsapi(country: str, country_code: str, timespan: str,
@@ -170,34 +307,87 @@ _FETCHERS = {
     "freenewsapi": _fetch_freenewsapi,
 }
 
+# Per-source fallback order. If the user-selected source is unhealthy or
+# the live fetch fails, we try the next entry before giving up. This is
+# what keeps the UI usable when GDELT is in a multi-minute 429 window.
+_FALLBACK_CHAIN = {
+    "gdelt": ["gdelt", "freenewsapi"],
+    "freenewsapi": ["freenewsapi", "gdelt"],
+}
 
-def _stories_for_country(source: str, country: str, country_code: str,
-                         timespan: str, max_records: int,
-                         domains: tuple[str, ...] = ()) -> list[dict]:
+
+def _try_fetch_one(source: str, country: str, country_code: str,
+                   timespan: str, max_records: int,
+                   domains: tuple[str, ...]) -> list[dict] | None:
+    """Attempt one source. Returns the payload on success, the most recent
+    cached payload (fresh or stale) on failure, or ``None`` when neither is
+    available (so the caller can try the next source in the chain).
+
+    Mutates ``_cache`` and ``_unhealthy_until`` as side effects.
+    """
+    # GDELT-only flags don't apply to FreeNewsApi, so don't let them split
+    # the cache key for FreeNewsApi.
+    effective_domains = domains if source == "gdelt" else ()
     key = (source, country.lower(), country_code.lower(), timespan,
-           max_records, domains)
+           max_records, effective_domains)
     now = time.time()
 
     with _cache_lock:
         cached = _cache.get(key)
-        if cached and now - cached[0] < _CACHE_TTL:
+    if cached and now - cached[0] < _CACHE_TTL:
+        return cached[1]
+
+    # In cooldown — don't bother hitting the upstream; degrade to stale.
+    if now < _unhealthy_until.get(source, 0.0):
+        if cached and now - cached[0] < _STALE_TTL:
+            print(f"[{source}:{country}] cooldown active; serving stale "
+                  f"({len(cached[1])} stories)", file=sys.stderr, flush=True)
             return cached[1]
+        return None
 
     with _source_locks[source]:
-        # Re-check cache under lock; another thread may have filled it.
         with _cache_lock:
             cached = _cache.get(key)
-            if cached and time.time() - cached[0] < _CACHE_TTL:
-                return cached[1]
+        if cached and time.time() - cached[0] < _CACHE_TTL:
+            return cached[1]
 
-        payload = _FETCHERS[source](country, country_code, timespan,
-                                    max_records, domains=list(domains))
+        try:
+            payload = _FETCHERS[source](country, country_code, timespan,
+                                        max_records,
+                                        domains=list(effective_domains))
+        except Exception as exc:  # noqa: BLE001 - try the fallback
+            _unhealthy_until[source] = time.time() + _UNHEALTHY_COOLDOWN
+            print(f"[{source}:{country}] fetch failed ({exc})",
+                  file=sys.stderr, flush=True)
+            if cached and time.time() - cached[0] < _STALE_TTL:
+                print(f"[{source}:{country}] serving stale "
+                      f"({len(cached[1])} stories)",
+                      file=sys.stderr, flush=True)
+                return cached[1]
+            return None
+
         print(f"[{source}:{country}] returned {len(payload)} stories",
               file=sys.stderr, flush=True)
-
         with _cache_lock:
             _cache[key] = (time.time(), payload)
         return payload
+
+
+def _stories_for_country(source: str, country: str, country_code: str,
+                         timespan: str, max_records: int,
+                         domains: tuple[str, ...] = ()) -> list[dict]:
+    chain = _FALLBACK_CHAIN.get(source, [source])
+    for candidate in chain:
+        result = _try_fetch_one(candidate, country, country_code, timespan,
+                                max_records, domains)
+        if result is not None:
+            if candidate != source:
+                print(f"[{source}:{country}] fell back to {candidate}",
+                      file=sys.stderr, flush=True)
+            return result
+    raise RuntimeError(
+        "All news sources are unavailable right now; try again shortly."
+    )
 
 
 def _format_stories_for_prompt(stories: list[dict]) -> str:
@@ -386,6 +576,13 @@ class Handler(BaseHTTPRequestHandler):
             d.strip().lower() for d in raw_domains.split(",") if d.strip()
         )
 
+        # Optional translation of story titles. Accepts 1/true/yes/on; the
+        # target language defaults to English but can be overridden via
+        # ``target_lang`` (e.g. ``target_lang=es``) for future use.
+        translate_raw = (params.get("translate") or ["0"])[0].strip().lower()
+        want_translate = translate_raw in {"1", "true", "yes", "on"}
+        target_lang = (params.get("target_lang") or ["en"])[0].strip() or "en"
+
         if not country:
             self._send_json(400, {"error": "country parameter is required"})
             return
@@ -407,19 +604,115 @@ class Handler(BaseHTTPRequestHandler):
             })
             return
 
+        translated = False
+        translate_error: str | None = None
+        if want_translate:
+            if not _TRANSLATE_AVAILABLE:
+                translate_error = (
+                    "Translation unavailable: install deep-translator "
+                    f"(pip install deep-translator). [{_TRANSLATE_IMPORT_ERROR}]"
+                )
+            else:
+                # Copy each dict so we don't poison the shared cache with
+                # translation fields (which would otherwise stick around for
+                # subsequent untranslated requests).
+                stories = [dict(s) for s in stories]
+                _translate_stories(stories, target_lang=target_lang)
+                translated = True
+
         self._send_json(200, {
             "source": source,
             "country": country,
             "country_code": country_code,
             "timespan": timespan,
             "count": len(stories),
+            "translated": translated,
+            "target_lang": target_lang if translated else None,
+            "translate_error": translate_error,
             "stories": stories,
         })
 
 
+# Countries most users click first. The background prefetcher quietly keeps
+# their GDELT cache entries warm so the click path almost always hits the
+# 30-min in-memory cache instead of waiting on a live GDELT request.
+POPULAR_COUNTRIES: tuple[tuple[str, str], ...] = (
+    ("United States", "US"), ("United Kingdom", "GB"), ("China", "CN"),
+    ("Russia", "RU"), ("France", "FR"), ("Germany", "DE"),
+    ("India", "IN"), ("Brazil", "BR"), ("Japan", "JP"),
+    ("Canada", "CA"), ("Australia", "AU"), ("Mexico", "MX"),
+    ("Italy", "IT"), ("Spain", "ES"), ("Republic of Korea", "KR"),
+    ("Indonesia", "ID"), ("Turkey", "TR"), ("Saudi Arabia", "SA"),
+    ("Egypt", "EG"), ("South Africa", "ZA"), ("Nigeria", "NG"),
+    ("Argentina", "AR"), ("Iran", "IR"), ("Israel", "IL"),
+    ("Ukraine", "UA"), ("Poland", "PL"), ("Netherlands", "NL"),
+    ("Sweden", "SE"), ("Pakistan", "PK"), ("Vietnam", "VN"),
+)
+
+
+# The user click sends max=75 (see script.js). The prefetcher uses the same
+# value so its cache entries are keyed identically and the click lands on a
+# direct cache hit.
+_PREFETCH_MAX = 75
+_PREFETCH_TIMESPAN = "24h"
+
+
+def _prefetch_one(name: str, code: str) -> None:
+    """Refresh the GDELT cache entry for one country without touching the
+    cooldown machinery. A prefetch 429 must never poison a user click — if
+    GDELT pushes back, we just skip this country and try the next one.
+    """
+    key = ("gdelt", name.lower(), code.lower(), _PREFETCH_TIMESPAN,
+           _PREFETCH_MAX, ())
+    with _cache_lock:
+        cached = _cache.get(key)
+    if cached and time.time() - cached[0] < _CACHE_TTL:
+        return  # still fresh; nothing to do
+
+    with _source_locks["gdelt"]:
+        # Re-check under lock; a concurrent user click may have just filled it.
+        with _cache_lock:
+            cached = _cache.get(key)
+        if cached and time.time() - cached[0] < _CACHE_TTL:
+            return
+
+        try:
+            payload = _fetch_gdelt(name, code, _PREFETCH_TIMESPAN,
+                                   _PREFETCH_MAX, domains=[])
+        except Exception as exc:  # noqa: BLE001 - prefetch is best-effort
+            print(f"[prefetch:{name}] {exc}", file=sys.stderr, flush=True)
+            return
+
+        with _cache_lock:
+            _cache[key] = (time.time(), payload)
+        print(f"[prefetch:{name}] warmed cache ({len(payload)} stories)",
+              file=sys.stderr, flush=True)
+
+
+def _prefetch_loop() -> None:
+    """Rotate through POPULAR_COUNTRIES forever, refreshing entries that have
+    expired. Sleeps generously between countries so the prefetcher doesn't
+    contribute to GDELT's perception of us as a hot caller — we'd rather take
+    half an hour to fully warm the cache than get the IP rate-limited.
+    """
+    import itertools
+    time.sleep(10.0)  # let the HTTP server settle first
+    for name, code in itertools.cycle(POPULAR_COUNTRIES):
+        _prefetch_one(name, code)
+        # ~10s between iterations keeps us well under GDELT's per-IP load
+        # threshold, and yields the lock so user clicks always win the race.
+        time.sleep(10.0)
+
+
 def main(host: str = "127.0.0.1", port: int = 8000) -> None:
     server = ThreadingHTTPServer((host, port), Handler)
+    prefetch_thread = threading.Thread(
+        target=_prefetch_loop, name="gdelt-prefetch", daemon=True,
+    )
+    prefetch_thread.start()
     print(f"Serving on http://{host}:{port}/  (Ctrl-C to stop)")
+    print(f"Prefetching GDELT cache for {len(POPULAR_COUNTRIES)} popular "
+          f"countries in the background.")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

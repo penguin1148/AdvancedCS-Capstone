@@ -84,8 +84,46 @@ function formatSeenDate(raw) {
   return d.toLocaleString();
 }
 
-function setStatus(msg) {
-  const el = document.getElementById("newsStatus");
+// ---------------------------------------------------------------------------
+// Slot-aware news panel plumbing.
+//
+// A "slot" is one news column. The single-country page (overview.html) only
+// uses slot 0. The two-country page (better_overview.html) uses slot 0 for
+// the first selected country and slot 1 for the second, so each country
+// gets its own column.
+//
+// Slot 0 looks up elements by their legacy IDs (newsList / newsStatus /
+// countryName) so the single-country page keeps working unchanged. Slots
+// above 0 look up suffixed IDs (newsList-1, etc.).
+// ---------------------------------------------------------------------------
+const _legacyIdFor = {
+  newsList: "newsList",
+  newsStatus: "newsStatus",
+  countryName: "countryName",
+};
+
+function _slotEl(slot, base) {
+  if (slot === 0) {
+    const legacy = document.getElementById(_legacyIdFor[base]);
+    if (legacy) return legacy;
+  }
+  return document.getElementById(`${base}-${slot}`);
+}
+
+// One mutable state object per slot. We allocate lazily so the page only
+// pays for slots it actually uses.
+const _slotState = new Map();
+function _stateFor(slot) {
+  let st = _slotState.get(slot);
+  if (!st) {
+    st = { requestId: 0, abort: null, activeCountry: null };
+    _slotState.set(slot, st);
+  }
+  return st;
+}
+
+function setStatus(msg, slot = 0) {
+  const el = _slotEl(slot, "newsStatus");
   if (el) el.textContent = msg;
 }
 
@@ -96,28 +134,34 @@ function trustedDomainsFor(countryCode) {
   return (list && list.length) ? list : null;
 }
 
-function renderStories(stories, opts) {
-  const list = document.getElementById("newsList");
+function renderStories(stories, opts, slot = 0) {
+  const list = _slotEl(slot, "newsList");
   if (!list) return;
   list.innerHTML = "";
 
   const info = opts || {};
   if (!stories || stories.length === 0) {
     if (info.trusted) {
-      setStatus(`No recent stories from trusted sources via ${getSource()}.`);
+      setStatus(`No recent stories from trusted sources via ${getSource()}.`, slot);
     } else {
-      setStatus("No recent stories found.");
+      setStatus("No recent stories found.", slot);
     }
     return;
   }
 
   const noun = stories.length === 1 ? "story" : "stories";
+  const translatedNote = info.translated ? " (translated)" : "";
   if (info.trusted) {
-    setStatus(`${stories.length} trusted ${noun} via ${getSource()}.`);
+    setStatus(`${stories.length} trusted ${noun} via ${getSource()}${translatedNote}.`, slot);
   } else {
-    setStatus(`${stories.length} recent ${noun} via ${getSource()}.`);
+    setStatus(`${stories.length} recent ${noun} via ${getSource()}${translatedNote}.`, slot);
+  }
+  if (info.translateError) {
+    setStatus(`${stories.length} ${noun} via ${getSource()}. ` +
+              `Translation skipped: ${info.translateError}`, slot);
   }
 
+  const showTranslated = !!info.translated;
   for (const s of stories) {
     const li = document.createElement("li");
     li.className = "news-item";
@@ -126,8 +170,28 @@ function renderStories(stories, opts) {
     a.href = s.url;
     a.target = "_blank";
     a.rel = "noopener noreferrer";
-    a.textContent = s.title || "(untitled)";
+    const original = s.title || "(untitled)";
+    const translated = s.translated_title || "";
+    const hasUsefulTranslation = showTranslated && translated &&
+                                 translated.trim() !== original.trim();
+    a.textContent = hasUsefulTranslation ? translated : original;
     a.className = "news-title";
+
+    li.appendChild(a);
+
+    // Surface the original headline beneath the translation so readers can
+    // verify the wording, and so non-English speakers can still match it
+    // against their source.
+    if (hasUsefulTranslation) {
+      const orig = document.createElement("div");
+      orig.className = "news-original";
+      orig.style.fontSize = "0.85em";
+      orig.style.opacity = "0.75";
+      orig.style.marginTop = "2px";
+      const lang = s.detected_language ? ` (${s.detected_language})` : "";
+      orig.textContent = `Original${lang}: ${original}`;
+      li.appendChild(orig);
+    }
 
     const meta = document.createElement("div");
     meta.className = "news-meta";
@@ -137,22 +201,17 @@ function renderStories(stories, opts) {
     if (s.seendate) pieces.push(formatSeenDate(s.seendate));
     meta.textContent = pieces.join("  \u00b7  ");
 
-    li.appendChild(a);
     li.appendChild(meta);
     list.appendChild(li);
   }
 }
 
-let currentRequest = 0;
-let currentAbort = null;
-// Most-recently selected country, so toggling source/timespan can refetch
-// without requiring another click.
-let activeCountry = null;
-
-// Hard ceiling for a single news request. Slightly above the server's
-// retry budget (15s timeout x 2 retries + backoffs) so slow-but-successful
-// calls still make it through, but runaway hangs don't pin the UI.
-const CLIENT_TIMEOUT_MS = 45000;
+// Hard ceiling for a single news request. Sized just above the server's
+// retry budget (18s timeout + 3 retries + ~30s of progressive backoff)
+// so a slow-but-successful GDELT call still makes it through, but
+// runaway hangs don't pin the UI. The server falls back to stale cache
+// or to FreeNewsApi only when GDELT really has nothing to give us.
+const CLIENT_TIMEOUT_MS = 90000;
 
 function getSource() {
   const el = document.getElementById("sourceSelect");
@@ -167,6 +226,11 @@ function getTimespan() {
 function isTrustedFilterOn() {
   const el = document.getElementById("trustedToggle");
   return el ? el.checked : true;
+}
+
+function isTranslateOn() {
+  const el = document.getElementById("translateToggle");
+  return el ? el.checked : false;
 }
 
 // Stories already fetched this session, keyed by country name, so the user
@@ -230,22 +294,50 @@ async function compareCountries() {
   }
 }
 
-async function loadNewsFor(country) {
-  if (!country || !country.name) return;
-  activeCountry = country;
-  const myRequest = ++currentRequest;
+// Clear one slot's UI and tear down any in-flight request. Used by the
+// two-country page's reset button (and when the user picks a fresh first
+// country, which implicitly resets slot 1).
+function clearSlot(slot) {
+  const st = _stateFor(slot);
+  if (st.abort) {
+    st.abort.abort();
+    st.abort = null;
+  }
+  st.activeCountry = null;
+  st.requestId++;  // invalidate any pending response from a prior fetch
 
-  // Abort any previous in-flight request so rapid clicks don't pile up.
-  if (currentAbort) currentAbort.abort();
+  const list = _slotEl(slot, "newsList");
+  if (list) list.innerHTML = "";
+  const status = _slotEl(slot, "newsStatus");
+  if (status) {
+    status.textContent = slot === 0
+      ? "Click a country on the map to load stories."
+      : "Click a second country to load stories.";
+  }
+  const name = _slotEl(slot, "countryName");
+  if (name) name.textContent = slot === 0 ? "Click a country" : "";
+}
+
+async function loadNewsFor(country, slot = 0) {
+  if (!country || !country.name) return;
+  const st = _stateFor(slot);
+  st.activeCountry = country;
+  const myRequest = ++st.requestId;
+
+  // Abort any previous in-flight request *for this slot* so rapid clicks
+  // don't pile up. Other slots' fetches keep running.
+  if (st.abort) st.abort.abort();
   const controller = new AbortController();
-  currentAbort = controller;
+  st.abort = controller;
   const timer = setTimeout(() => controller.abort(), CLIENT_TIMEOUT_MS);
 
   const source = getSource();
   const timespan = getTimespan();
 
-  document.getElementById("countryName").innerText = country.name;
-  document.getElementById("newsList").innerHTML = "";
+  const nameEl = _slotEl(slot, "countryName");
+  if (nameEl) nameEl.innerText = country.name;
+  const listEl = _slotEl(slot, "newsList");
+  if (listEl) listEl.innerHTML = "";
 
   // For GDELT with the trusted filter on, restrict the upstream query to
   // this country's trusted publishers so the API returns stories drawn from
@@ -257,10 +349,14 @@ async function loadNewsFor(country) {
     : null;
   if (source === "gdelt" && trustedOn && !trustedDomains) {
     setStatus(`No trusted sources configured for ${country.name}. ` +
-              `Uncheck "Trusted sources only" to see all GDELT results.`);
+              `Uncheck "Trusted sources only" to see all GDELT results.`, slot);
     return;
   }
-  setStatus(`Loading news for ${country.name} via ${source}\u2026`);
+  const translateOn = isTranslateOn();
+  const loadingSuffix = translateOn
+    ? " (translating, this can take a moment)\u2026"
+    : "\u2026";
+  setStatus(`Loading news for ${country.name} via ${source}${loadingSuffix}`, slot);
 
   try {
     const params = new URLSearchParams({
@@ -268,58 +364,81 @@ async function loadNewsFor(country) {
       country_code: country.code || "",
       source,
       timespan,
-      max: "50",
+      max: "75",
     });
     if (trustedDomains) params.set("domains", trustedDomains.join(","));
+    if (translateOn) params.set("translate", "1");
     const resp = await fetch(`/api/news?${params}`, { signal: controller.signal });
-    if (myRequest !== currentRequest) return;
+    if (myRequest !== st.requestId) return;
 
     const data = await resp.json().catch(() => ({}));
     if (!resp.ok) {
-      setStatus(`Error (${source}): ${data.error || resp.statusText}`);
+      setStatus(`Error (${source}): ${data.error || resp.statusText}`, slot);
       return;
     }
     const stories = data.stories || [];
-    renderStories(stories, { trusted: !!trustedDomains });
+    renderStories(stories, {
+      trusted: !!trustedDomains,
+      translated: !!data.translated,
+      translateError: data.translate_error || null,
+    }, slot);
     rememberStories(country, stories);
   } catch (err) {
-    if (myRequest !== currentRequest) return;
+    if (myRequest !== st.requestId) return;
     if (err && err.name === "AbortError") {
       setStatus(`Timed out after ${CLIENT_TIMEOUT_MS / 1000}s. ` +
-                `Upstream (${source}) may be rate-limiting \u2014 try again.`);
+                `Upstream (${source}) may be rate-limiting \u2014 try again.`, slot);
     } else {
-      setStatus(`Request failed: ${err.message || err}`);
+      setStatus(`Request failed: ${err.message || err}`, slot);
     }
   } finally {
     clearTimeout(timer);
-    if (currentAbort === controller) currentAbort = null;
+    if (st.abort === controller) st.abort = null;
   }
 }
 
-window.onload = () => {
-  const countries = document.querySelectorAll("svg path");
-  countries.forEach(country => {
-    country.addEventListener("click", () => {
-      const info = resolveCountry(country);
-      if (!info.name) {
-        setStatus("Could not identify that country.");
-        return;
-      }
-      loadNewsFor(info);
-    });
-  });
+// Re-fetch every slot that has an active country. Called when a shared
+// control (source/timespan/trusted/translate) changes \u2014 both panels need
+// to reflect the new setting.
+function reloadAllSlots() {
+  for (const [slot, st] of _slotState.entries()) {
+    if (st.activeCountry) loadNewsFor(st.activeCountry, slot);
+  }
+}
 
-  // Re-fetch when the user changes source or timespan, as long as we have
-  // a country selected.
-  for (const id of ["sourceSelect", "timespanSelect", "trustedToggle"]) {
+// Expose helpers the two-country page's inline script needs.
+window.loadNewsFor = loadNewsFor;
+window.clearSlot = clearSlot;
+window.resolveCountry = resolveCountry;
+
+window.addEventListener("load", () => {
+  // The better_overview map has its own click handler (two-country
+  // selection + arc), and calls loadNewsFor() directly for each pick.
+  // Detect that page by its #selectionBox element and skip the auto
+  // click-binding so we don't double-handle clicks there.
+  if (!document.getElementById("selectionBox")) {
+    const countries = document.querySelectorAll("svg path");
+    countries.forEach(country => {
+      country.addEventListener("click", () => {
+        const info = resolveCountry(country);
+        if (!info.name) {
+          setStatus("Could not identify that country.");
+          return;
+        }
+        loadNewsFor(info);
+      });
+    });
+  }
+
+  // Re-fetch when the user changes source/timespan/etc., across every
+  // slot that has a country loaded.
+  for (const id of ["sourceSelect", "timespanSelect", "trustedToggle", "translateToggle"]) {
     const el = document.getElementById(id);
     if (el) {
-      el.addEventListener("change", () => {
-        if (activeCountry) loadNewsFor(activeCountry);
-      });
+      el.addEventListener("change", reloadAllSlots);
     }
   }
 
   const compareBtn = document.getElementById("compareBtn");
   if (compareBtn) compareBtn.addEventListener("click", compareCountries);
-};
+});

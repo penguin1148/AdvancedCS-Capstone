@@ -2,59 +2,37 @@
 <html>
 <head>
   <title>Interactive World Map</title>
-
   <style>
     body {
-      font-family: Arial, sans-serif;
+      font-family: Arial;
+      text-align: center;
       margin: 0;
       background: #fafafa;
     }
-
-    h2 {
-      text-align: center;
-      margin: 16px 0 8px;
-    }
-
+    h2 { margin: 16px 0 8px; }
     .layout {
       display: flex;
       gap: 16px;
       padding: 0 16px 16px;
       align-items: flex-start;
     }
-
-    #map {
+    .leftCol {
       flex: 1 1 auto;
       min-width: 0;
-      text-align: center;
     }
-
+    #map {
+      width: 100%;
+      margin: auto;
+    }
     svg {
       width: 100%;
-      height: auto;
-      max-width: 1200px;
+      max-width: 1000px;
     }
-
-    /* Countries */
-    svg path {
-      fill: lightgray;
-      stroke: white;
-      stroke-width: 0.5;
-      cursor: pointer;
-      transition: fill 0.2s ease;
-    }
-
-    svg path:hover {
-      fill: orange;
-    }
-
-    #countryName {
-      margin-top: 12px;
-      font-size: 22px;
-      font-weight: bold;
-    }
-
-    #newsPanel {
-      flex: 0 0 360px;
+    /* Each news column is its own sticky panel; the controls live inside
+       the first one so they're visible without scrolling, and the second
+       column shows up only after the user picks a second country. */
+    .newsPanel {
+      flex: 0 0 320px;
       max-height: 90vh;
       overflow-y: auto;
       background: #fff;
@@ -64,13 +42,22 @@
       box-shadow: 0 1px 3px rgba(0, 0, 0, 0.06);
       position: sticky;
       top: 16px;
+      text-align: left;
     }
-
-    #newsPanel h3 {
-      margin: 0 0 8px;
+    .newsPanel.hidden { display: none; }
+    .newsPanel h3 {
+      margin: 0 0 4px;
       font-size: 18px;
+      display: flex;
+      align-items: baseline;
+      gap: 8px;
+      flex-wrap: wrap;
     }
-
+    .panelCountryName {
+      font-size: 14px;
+      font-weight: 500;
+      color: #1a4fb5;
+    }
     .news-controls {
       display: flex;
       align-items: center;
@@ -79,34 +66,16 @@
       font-size: 13px;
       color: #555;
     }
-
-    .news-controls select {
-      font-size: 13px;
-      padding: 2px 4px;
-    }
-
-    #newsStatus {
+    .news-controls select { font-size: 13px; padding: 2px 4px; }
+    .newsPanel .news-status {
       font-size: 13px;
       color: #666;
       margin-bottom: 8px;
       min-height: 1em;
     }
-
-    #newsList {
-      list-style: none;
-      padding: 0;
-      margin: 0;
-    }
-
-    .news-item {
-      padding: 10px 0;
-      border-bottom: 1px solid #eee;
-    }
-
-    .news-item:last-child {
-      border-bottom: none;
-    }
-
+    .newsPanel ul { list-style: none; padding: 0; margin: 0; }
+    .news-item { padding: 10px 0; border-bottom: 1px solid #eee; }
+    .news-item:last-child { border-bottom: none; }
     .news-title {
       color: #1a4fb5;
       text-decoration: none;
@@ -114,76 +83,88 @@
       line-height: 1.3;
       display: block;
     }
-
-    .news-title:hover {
-      text-decoration: underline;
+    .news-title:hover { text-decoration: underline; }
+    .news-meta { font-size: 12px; color: #777; margin-top: 4px; }
+    #countryName {
+      margin-top: 12px;
+      font-size: 22px;
+      font-weight: bold;
     }
-
-    .news-meta {
-      font-size: 12px;
-      color: #777;
-      margin-top: 4px;
-    }
-
-    #comparePanel {
-      margin-top: 18px;
-      padding-top: 14px;
-      border-top: 2px solid #eee;
-    }
-
-    #comparePanel h4 {
-      margin: 0 0 8px;
-      font-size: 14px;
-    }
-
-    #compareBtn {
-      padding: 6px 12px;
-      font-size: 13px;
-      cursor: pointer;
-      border: 1px solid #1a4fb5;
-      background: #1a4fb5;
-      color: #fff;
-      border-radius: 4px;
-    }
-
-    #compareBtn:hover { background: #163f93; }
-
-    #compareStatus {
-      font-size: 13px;
-      color: #666;
-      margin: 8px 0;
-      min-height: 1em;
-    }
-
     #compareResult {
       font-size: 13px;
       line-height: 1.45;
       white-space: pre-wrap;
       word-wrap: break-word;
+      margin-top: 8px;
     }
-
-    @media (max-width: 900px) {
+    @media (max-width: 1100px) {
       .layout { flex-direction: column; }
-      #newsPanel { flex: 1 1 auto; width: auto; position: static; max-height: none; }
+      .newsPanel { flex: 1 1 auto; width: auto; position: static; max-height: none; }
+    }
+    svg path {
+      fill: lightgray;
+      stroke: rgb(0, 0, 0);
+      cursor: pointer;
+      transition: 0.2s;
+    }
+    svg path:hover {
+      fill: orange;
+    }
+    #selectionBox {
+      margin-top: 20px;
+      font-size: 18px;
+    }
+    button {
+      margin-top: 10px;
+      padding: 8px 15px;
+      font-size: 16px;
+      cursor: pointer;
+    }
+    #searchContainer {
+      margin: 15px auto;
+      width: 300px;
+      position: relative;
+    }
+    #searchInput {
+      width: 100%;
+      padding: 8px 12px;
+      font-size: 16px;
+      border: 1px solid #ccc;
+      border-radius: 6px;
+      box-sizing: border-box;
+    }
+    #dropdown {
+      position: absolute;
+      width: 100%;
+      background: white;
+      border: 1px solid #ccc;
+      border-top: none;
+      border-radius: 0 0 6px 6px;
+      max-height: 200px;
+      overflow-y: auto;
+      z-index: 999;
+      display: none;
+    }
+    #dropdown div {
+      padding: 8px 12px;
+      cursor: pointer;
+      text-align: left;
+      font-size: 15px;
+    }
+    #dropdown div:hover {
+      background: #f0f0f0;
     }
   </style>
 </head>
-
 <body>
 
-<h2>Click a Country to Read News from GDELT</h2>
+<h2>Select 2 Countries</h2>
 
 <div class="layout">
+<div class="leftCol">
 <div id="map">
-
-  <!-- 🌍 PASTE YOUR SIMPLEMAPS SVG HERE -->
-  <!-- Example:
-  <svg xmlns="http://www.w3.org/2000/svg" viewBox="...">
-    <path id="us" d="..." />
-    <path id="fr" d="..." />
-  </svg>
-  -->
-<?xml version="1.0" encoding="UTF-8"?>
+  <!-- PASTE YOUR SVG MAP HERE -->
+   <?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" width="965" height="503" viewBox="-2.5 70.5 965 503">
   <!-- Created using SVG Map Generator: dojo.amcharts.com/svg-map-generator -->
   <style>
@@ -449,11 +430,23 @@
     <path d="M289.79,279.13L289.67,279.17L289.36,278.83L289.61,278.76Z" class="land" id="AW" title="Aruba"/>
   </g>
 </svg>
+</div>
+
+<div id="searchContainer">
+  <input type="text" id="searchInput" placeholder="Search for a country..." />
+  <div id="dropdown"></div>
+</div>
+
+<div id="selectionBox">
+  <p>Country 1: <span id="country1">None</span></p>
+  <p>Country 2: <span id="country2">None</span></p>
+  <button onclick="resetSelection()">Reset</button>
+</div>
 <div id="countryName">Click a country</div>
 </div>
 
-<aside id="newsPanel">
-  <h3>Country News</h3>
+<aside id="newsPanel" class="newsPanel">
+  <h3>Country 1 News</h3>
   <div class="news-controls">
     <label for="sourceSelect">Source</label>
     <select id="sourceSelect">
@@ -473,8 +466,8 @@
   </div>
   <div class="news-controls">
     <label for="trustedToggle">
-      <input type="checkbox" id="trustedToggle" checked>
-      Trusted sources only
+      <input type="checkbox" id="trustedToggle">
+      Trusted sources only (GDELT)
     </label>
   </div>
   <div class="news-controls">
@@ -483,25 +476,270 @@
       Translate headlines to English
     </label>
   </div>
-  <div id="newsStatus">Click a country on the map to load stories.</div>
+  <div id="newsStatus" class="news-status">Click a country on the map to load stories.</div>
   <ul id="newsList"></ul>
+</aside>
 
-  <div id="comparePanel">
-    <h4>Compare two countries</h4>
-    <div class="news-controls">
-      <select id="compareA"><option value="">Country A…</option></select>
-      <select id="compareB"><option value="">Country B…</option></select>
-    </div>
-    <button id="compareBtn" type="button">Compare with Claude</button>
-    <div id="compareStatus"></div>
-    <div id="compareResult"></div>
+<!-- Second news column: appears when the user picks a second country.
+     Has no controls of its own; the shared controls in the first panel
+     drive both columns. -->
+<aside id="newsPanel-1" class="newsPanel hidden">
+  <h3>Country 2 News <span class="panelCountryName" id="countryName-1"></span></h3>
+  <div id="newsStatus-1" class="news-status">Click a second country to load stories.</div>
+  <ul id="newsList-1"></ul>
+</aside>
+
+<aside id="comparePanel" class="newsPanel">
+  <h3>Compare two countries</h3>
+  <div class="news-controls">
+    <select id="compareA"><option value="">Country A…</option></select>
+    <select id="compareB"><option value="">Country B…</option></select>
   </div>
+  <button id="compareBtn" type="button">Compare with Claude</button>
+  <div id="compareStatus" class="news-status"></div>
+  <div id="compareResult"></div>
 </aside>
 
 </div>
 
 <script src="trustedsources.js"></script>
 <script src="script.js"></script>
+
+<script>
+// -----------------------------
+// STATE
+// -----------------------------
+let selectedCountries = [];
+let highlightedEls = [];
+let clickPoints = [];
+let countryList = [];
+
+const IGNORE_IDS = new Set(["polygons", "layers", "layer", "map", "svg", "world"]);
+
+// -----------------------------
+// INIT
+// -----------------------------
+window.onload = () => {
+  buildCountryList();
+
+  document.getElementById("searchInput").addEventListener("input", handleSearch);
+
+  document.addEventListener("click", (e) => {
+    if (!document.getElementById("searchContainer").contains(e.target)) {
+      closeDropdown();
+    }
+  });
+
+  const regions = document.querySelectorAll("svg path, svg g");
+  regions.forEach(region => {
+    region.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const svgPoint = getSVGPoint(e);
+      handleClick(region, svgPoint);
+    });
+  });
+};
+
+// -----------------------------
+// GET COUNTRY CODE
+// -----------------------------
+function getCountryCode(el) {
+  let node = el;
+  while (node && node.tagName !== "svg") {
+    const id = (node.id || "").toUpperCase().trim();
+    if (id && !IGNORE_IDS.has(id.toLowerCase())) {
+      return id;
+    }
+    node = node.parentElement;
+  }
+  return null;
+}
+
+// -----------------------------
+// CLICK HANDLER
+// -----------------------------
+function handleClick(region, point) {
+  const code = getCountryCode(region);
+  if (!code) return;
+
+  if (selectedCountries.includes(code)) return;
+
+  if (selectedCountries.length >= 2) {
+    resetSelection();
+  }
+
+  selectedCountries.push(code);
+  highlightedEls.push(region);
+
+  // Store exact click point, fall back to bounding box center for search
+  if (point) {
+    clickPoints.push(point);
+  } else {
+    clickPoints.push(getCenterOfElement(region));
+  }
+
+  const color = selectedCountries.length === 1 ? "lightblue" : "yellow";
+  region.style.fill = color;
+
+  // Pick number -> selection-box slot (1-indexed display) and news-panel
+  // slot (0-indexed). Each click loads news for its own country into its
+  // own column.
+  const pickIndex = selectedCountries.length - 1;  // 0 or 1
+  const labelEl = pickIndex === 0 ? "country1" : "country2";
+  document.getElementById(labelEl).innerText = code;
+
+  if (typeof window.loadNewsFor === "function") {
+    const info = (typeof window.resolveCountry === "function")
+      ? window.resolveCountry(region)
+      : { name: region.getAttribute("title") || code, code };
+    if (pickIndex === 1) {
+      // Reveal the second column on the first time we use it.
+      const panel = document.getElementById("newsPanel-1");
+      if (panel) panel.classList.remove("hidden");
+    }
+    window.loadNewsFor(info, pickIndex);
+  }
+
+  if (selectedCountries.length === 2) {
+    drawArc(clickPoints[0], clickPoints[1]);
+  }
+}
+
+// -----------------------------
+// RESET
+// -----------------------------
+function resetSelection() {
+  selectedCountries = [];
+  clickPoints = [];
+
+  highlightedEls.forEach(el => { el.style.fill = ""; });
+  highlightedEls = [];
+
+  document.getElementById("country1").innerText = "None";
+  document.getElementById("country2").innerText = "None";
+
+  // Tear down both news columns (cancels any in-flight fetches, clears
+  // lists, restores the placeholder status).
+  if (typeof window.clearSlot === "function") {
+    window.clearSlot(0);
+    window.clearSlot(1);
+  }
+  const panel1 = document.getElementById("newsPanel-1");
+  if (panel1) panel1.classList.add("hidden");
+  const cn = document.getElementById("countryName");
+  if (cn) cn.textContent = "Click a country";
+
+  clearArc();
+}
+
+// -----------------------------
+// SVG COORDINATE CONVERSION
+// -----------------------------
+function getSVGPoint(e) {
+  const svg = document.querySelector("svg");
+  const pt = svg.createSVGPoint();
+  pt.x = e.clientX;
+  pt.y = e.clientY;
+  return pt.matrixTransform(svg.getScreenCTM().inverse());
+}
+
+// -----------------------------
+// BOUNDING BOX CENTER (fallback for search)
+// -----------------------------
+function getCenterOfElement(el) {
+  const bbox = el.getBBox();
+  return {
+    x: bbox.x + bbox.width / 2,
+    y: bbox.y + bbox.height / 2
+  };
+}
+
+// -----------------------------
+// ARC
+// -----------------------------
+function drawArc(p1, p2) {
+  const svg = document.querySelector("svg");
+  clearArc();
+
+  const mx = (p1.x + p2.x) / 2;
+  const my = (p1.y + p2.y) / 2;
+
+  const dx = p2.x - p1.x;
+  const dy = p2.y - p1.y;
+  const distance = Math.sqrt(dx * dx + dy * dy);
+
+  const curvature = 0.1; // Adjust this for more/less curve
+  const cx = mx;
+  const cy = my - distance * curvature;
+
+  const arc = document.createElementNS("http://www.w3.org/2000/svg", "path");
+  arc.setAttribute("id", "flightArc");
+  arc.setAttribute("d", `M ${p1.x} ${p1.y} Q ${cx} ${cy} ${p2.x} ${p2.y}`);
+  arc.setAttribute("fill", "none");
+  arc.setAttribute("fill-opacity", "0");
+  arc.setAttribute("stroke", "black");
+  arc.setAttribute("stroke-width", "1.5");
+  arc.setAttribute("stroke-linecap", "round");
+  arc.setAttribute("pointer-events", "none");
+  svg.appendChild(arc);
+}
+
+function clearArc() {
+  const existing = document.getElementById("flightArc");
+  if (existing) existing.remove();
+  document.querySelectorAll(".arcDot").forEach(d => d.remove());
+}
+
+// -----------------------------
+// SEARCH BAR
+// -----------------------------
+function buildCountryList() {
+  const seen = new Set();
+  document.querySelectorAll("svg path, svg g").forEach(el => {
+    const id = getCountryCode(el);
+    if (id && !seen.has(id)) {
+      seen.add(id);
+      countryList.push({ id, el });
+    }
+  });
+  countryList.sort((a, b) => a.id.localeCompare(b.id));
+}
+
+function handleSearch() {
+  const query = document.getElementById("searchInput").value.trim().toLowerCase();
+  const dropdown = document.getElementById("dropdown");
+
+  if (!query) {
+    closeDropdown();
+    return;
+  }
+
+  const matches = countryList.filter(c => c.id.toLowerCase().includes(query));
+
+  if (matches.length === 0) {
+    closeDropdown();
+    return;
+  }
+
+  dropdown.innerHTML = "";
+  matches.forEach(({ id, el }) => {
+    const option = document.createElement("div");
+    option.textContent = id;
+    option.addEventListener("click", () => {
+      handleClick(el, null);
+      document.getElementById("searchInput").value = "";
+      closeDropdown();
+    });
+    dropdown.appendChild(option);
+  });
+
+  dropdown.style.display = "block";
+}
+
+function closeDropdown() {
+  document.getElementById("dropdown").style.display = "none";
+}
+</script>
 
 </body>
 </html>
