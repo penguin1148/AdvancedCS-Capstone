@@ -169,6 +169,67 @@ function isTrustedFilterOn() {
   return el ? el.checked : true;
 }
 
+// Stories already fetched this session, keyed by country name, so the user
+// can pick any two of them to compare without re-fetching.
+const fetchedStories = {};
+
+function rememberStories(country, stories) {
+  if (!country || !country.name || !stories || !stories.length) return;
+  fetchedStories[country.name] = { code: country.code || "", stories };
+  refreshCompareOptions();
+}
+
+function refreshCompareOptions() {
+  const names = Object.keys(fetchedStories).sort();
+  for (const id of ["compareA", "compareB"]) {
+    const sel = document.getElementById(id);
+    if (!sel) continue;
+    const current = sel.value;
+    const label = id === "compareA" ? "Country A…" : "Country B…";
+    sel.innerHTML = `<option value="">${label}</option>` +
+      names.map(n => `<option value="${n}">${n}</option>`).join("");
+    if (names.includes(current)) sel.value = current;
+  }
+}
+
+async function compareCountries() {
+  const aName = document.getElementById("compareA").value;
+  const bName = document.getElementById("compareB").value;
+  const status = document.getElementById("compareStatus");
+  const result = document.getElementById("compareResult");
+  result.textContent = "";
+
+  if (!aName || !bName) {
+    status.textContent = "Pick two countries you've already loaded.";
+    return;
+  }
+  if (aName === bName) {
+    status.textContent = "Pick two different countries.";
+    return;
+  }
+
+  status.textContent = `Comparing ${aName} and ${bName} with Claude…`;
+  try {
+    const resp = await fetch("/api/compare", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        a: { name: aName, code: fetchedStories[aName].code, stories: fetchedStories[aName].stories },
+        b: { name: bName, code: fetchedStories[bName].code, stories: fetchedStories[bName].stories },
+      }),
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      status.textContent = `Compare failed: ${data.error || resp.statusText}`;
+      return;
+    }
+    status.textContent = `Comparison of ${aName} vs ${bName} (via ${data.model}):`;
+    result.textContent = data.analysis || "(no analysis returned)";
+  } catch (err) {
+    status.textContent = `Compare request failed: ${err.message || err}`;
+  }
+}
+
 async function loadNewsFor(country) {
   if (!country || !country.name) return;
   activeCountry = country;
@@ -218,7 +279,9 @@ async function loadNewsFor(country) {
       setStatus(`Error (${source}): ${data.error || resp.statusText}`);
       return;
     }
-    renderStories(data.stories || [], { trusted: !!trustedDomains });
+    const stories = data.stories || [];
+    renderStories(stories, { trusted: !!trustedDomains });
+    rememberStories(country, stories);
   } catch (err) {
     if (myRequest !== currentRequest) return;
     if (err && err.name === "AbortError") {
@@ -256,4 +319,7 @@ window.onload = () => {
       });
     }
   }
+
+  const compareBtn = document.getElementById("compareBtn");
+  if (compareBtn) compareBtn.addEventListener("click", compareCountries);
 };
