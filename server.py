@@ -506,6 +506,18 @@ def _compare_news(a_name: str, a_stories: list[dict],
 class Handler(BaseHTTPRequestHandler):
     server_version = "GdeltMapServer/1.0"
 
+    # The client hung up before we finished responding — almost always because
+    # the user clicked a new country (the browser aborts the in-flight fetch)
+    # or closed the tab. The work is already done and cached, so there's
+    # nothing to recover: log one line instead of dumping a traceback.
+    _DISCONNECT_ERRORS = (
+        BrokenPipeError, ConnectionResetError, ConnectionAbortedError,
+    )
+
+    def _note_disconnect(self) -> None:
+        print(f"[client] disconnected before response completed "
+              f"({self.command} {self.path})", file=sys.stderr, flush=True)
+
     def log_message(self, format: str, *args) -> None:  # noqa: A002 - stdlib sig
         # Drop 200s but keep error lines so users can see what's happening.
         status = args[1] if len(args) >= 2 else ""
@@ -516,12 +528,15 @@ class Handler(BaseHTTPRequestHandler):
 
     def _send_json(self, status: int, body: dict | list) -> None:
         data = json.dumps(body).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(data)))
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        self.wfile.write(data)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(data)
+        except self._DISCONNECT_ERRORS:
+            self._note_disconnect()
 
     def _send_static(self, filename: str, content_type: str) -> None:
         path = os.path.join(HERE, filename)
@@ -531,33 +546,42 @@ class Handler(BaseHTTPRequestHandler):
         except FileNotFoundError:
             self.send_error(404, "Not found")
             return
-        self.send_response(200)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        except self._DISCONNECT_ERRORS:
+            self._note_disconnect()
 
     def do_GET(self) -> None:  # noqa: N802 - stdlib spelling
-        parsed = urllib.parse.urlparse(self.path)
-        path = parsed.path
+        try:
+            parsed = urllib.parse.urlparse(self.path)
+            path = parsed.path
 
-        if path in STATIC_FILES:
-            filename, ctype = STATIC_FILES[path]
-            self._send_static(filename, ctype)
-            return
+            if path in STATIC_FILES:
+                filename, ctype = STATIC_FILES[path]
+                self._send_static(filename, ctype)
+                return
 
-        if path == "/api/news":
-            self._handle_news(parsed.query)
-            return
+            if path == "/api/news":
+                self._handle_news(parsed.query)
+                return
 
-        self.send_error(404, "Not found")
+            self.send_error(404, "Not found")
+        except self._DISCONNECT_ERRORS:
+            self._note_disconnect()
 
     def do_POST(self) -> None:  # noqa: N802 - stdlib spelling
-        parsed = urllib.parse.urlparse(self.path)
-        if parsed.path == "/api/compare":
-            self._handle_compare()
-            return
-        self.send_error(404, "Not found")
+        try:
+            parsed = urllib.parse.urlparse(self.path)
+            if parsed.path == "/api/compare":
+                self._handle_compare()
+                return
+            self.send_error(404, "Not found")
+        except self._DISCONNECT_ERRORS:
+            self._note_disconnect()
 
     def _read_json_body(self) -> dict:
         length = int(self.headers.get("Content-Length") or 0)
