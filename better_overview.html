@@ -90,6 +90,13 @@
       font-size: 22px;
       font-weight: bold;
     }
+    #compareResult {
+      font-size: 13px;
+      line-height: 1.45;
+      white-space: pre-wrap;
+      word-wrap: break-word;
+      margin-top: 8px;
+    }
     @media (max-width: 1100px) {
       .layout { flex-direction: column; }
       .newsPanel { flex: 1 1 auto; width: auto; position: static; max-height: none; }
@@ -480,6 +487,17 @@
   <h3>Country 2 News <span class="panelCountryName" id="countryName-1"></span></h3>
   <div id="newsStatus-1" class="news-status">Click a second country to load stories.</div>
   <ul id="newsList-1"></ul>
+</aside>
+
+<aside id="comparePanel" class="newsPanel">
+  <h3>Compare two countries</h3>
+  <div class="news-controls">
+    <select id="compareA"><option value="">Country A…</option></select>
+    <select id="compareB"><option value="">Country B…</option></select>
+  </div>
+  <button id="compareBtn" type="button">Compare with Claude</button>
+  <div id="compareStatus" class="news-status"></div>
+  <div id="compareResult"></div>
 </aside>
 
 </div>

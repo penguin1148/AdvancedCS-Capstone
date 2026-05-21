@@ -125,6 +125,43 @@
       margin-top: 4px;
     }
 
+    #comparePanel {
+      margin-top: 18px;
+      padding-top: 14px;
+      border-top: 2px solid #eee;
+    }
+
+    #comparePanel h4 {
+      margin: 0 0 8px;
+      font-size: 14px;
+    }
+
+    #compareBtn {
+      padding: 6px 12px;
+      font-size: 13px;
+      cursor: pointer;
+      border: 1px solid #1a4fb5;
+      background: #1a4fb5;
+      color: #fff;
+      border-radius: 4px;
+    }
+
+    #compareBtn:hover { background: #163f93; }
+
+    #compareStatus {
+      font-size: 13px;
+      color: #666;
+      margin: 8px 0;
+      min-height: 1em;
+    }
+
+    #compareResult {
+      font-size: 13px;
+      line-height: 1.45;
+      white-space: pre-wrap;
+      word-wrap: break-word;
+    }
+
     @media (max-width: 900px) {
       .layout { flex-direction: column; }
       #newsPanel { flex: 1 1 auto; width: auto; position: static; max-height: none; }
@@ -448,6 +485,17 @@
   </div>
   <div id="newsStatus">Click a country on the map to load stories.</div>
   <ul id="newsList"></ul>
+
+  <div id="comparePanel">
+    <h4>Compare two countries</h4>
+    <div class="news-controls">
+      <select id="compareA"><option value="">Country A…</option></select>
+      <select id="compareB"><option value="">Country B…</option></select>
+    </div>
+    <button id="compareBtn" type="button">Compare with Claude</button>
+    <div id="compareStatus"></div>
+    <div id="compareResult"></div>
+  </div>
 </aside>
 
 </div>

@@ -54,6 +54,12 @@ WEB_MAX_BACKOFF = 12.0      # cap any single backoff at this many seconds
 
 VALID_SOURCES = {"gdelt", "freenewsapi"}
 
+# Cheap model for the country-comparison feature. Pulled from the env var
+# ANTHROPIC_API_KEY at request time so the key is never committed to source.
+COMPARE_MODEL = "claude-haiku-4-5"
+COMPARE_MAX_STORIES = 50      # cap per country to bound prompt size
+COMPARE_MAX_TOKENS = 1500
+
 # When an upstream returns 429 / errors out *after* exhausting retries, mark
 # it unhealthy for this long so the next request goes to the fallback (or
 # stale cache) instead of repeating the same slow failure. Short enough that
@@ -384,6 +390,70 @@ def _stories_for_country(source: str, country: str, country_code: str,
     )
 
 
+def _format_stories_for_prompt(stories: list[dict]) -> str:
+    lines = []
+    for s in stories[:COMPARE_MAX_STORIES]:
+        title = (s.get("title") or "").strip() or "(untitled)"
+        domain = s.get("domain") or "?"
+        mentioned = ", ".join(s.get("mentioned_countries") or [])
+        line = f"- [{domain}] {title}"
+        if mentioned:
+            line += f"  (mentions: {mentioned})"
+        lines.append(line)
+    return "\n".join(lines) if lines else "(no stories)"
+
+
+def _compare_news(a_name: str, a_stories: list[dict],
+                  b_name: str, b_stories: list[dict]) -> str:
+    """Ask a cheap Claude model to compare two countries' news batches.
+
+    Reads the API key from ANTHROPIC_API_KEY (never hard-coded). Raises
+    RuntimeError with a clean message if the key or SDK is missing.
+    """
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        raise RuntimeError(
+            "ANTHROPIC_API_KEY is not set. Export it before starting the "
+            "server, e.g. `export ANTHROPIC_API_KEY=sk-ant-...`."
+        )
+    try:
+        import anthropic
+    except ImportError as exc:
+        raise RuntimeError(
+            "The 'anthropic' package is not installed. Run `pip install anthropic`."
+        ) from exc
+
+    client = anthropic.Anthropic()
+    system = (
+        "You are a media-bias analyst. You compare how two countries' trusted "
+        "news outlets cover the world, focusing on where each country is "
+        "mentioned, how framing differs between sources, and potential biases. "
+        "Be concise and specific, cite outlet domains, and never invent stories "
+        "that are not in the provided lists."
+    )
+    user = (
+        f"Compare the recent news coverage from these two countries' trusted "
+        f"sources.\n\n"
+        f"## {a_name} sources\n{_format_stories_for_prompt(a_stories)}\n\n"
+        f"## {b_name} sources\n{_format_stories_for_prompt(b_stories)}\n\n"
+        f"Provide three short markdown sections:\n"
+        f"1. **Overlap** — topics or events where BOTH {a_name} and {b_name} "
+        f"appear, or that both sets of outlets cover.\n"
+        f"2. **Framing** — how shared topics are presented differently across "
+        f"the outlets.\n"
+        f"3. **Potential biases** — slants, omissions, or loaded language, each "
+        f"tied to an outlet domain.\n\n"
+        f"Keep the whole response under ~400 words."
+    )
+
+    message = client.messages.create(
+        model=COMPARE_MODEL,
+        max_tokens=COMPARE_MAX_TOKENS,
+        system=system,
+        messages=[{"role": "user", "content": user}],
+    )
+    return "".join(b.text for b in message.content if b.type == "text").strip()
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "GdeltMapServer/1.0"
 
@@ -432,6 +502,59 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         self.send_error(404, "Not found")
+
+    def do_POST(self) -> None:  # noqa: N802 - stdlib spelling
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/api/compare":
+            self._handle_compare()
+            return
+        self.send_error(404, "Not found")
+
+    def _read_json_body(self) -> dict:
+        length = int(self.headers.get("Content-Length") or 0)
+        if length <= 0:
+            return {}
+        raw = self.rfile.read(length)
+        try:
+            return json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return {}
+
+    def _handle_compare(self) -> None:
+        body = self._read_json_body()
+        a = body.get("a") or {}
+        b = body.get("b") or {}
+        a_name = (a.get("name") or "").strip()
+        b_name = (b.get("name") or "").strip()
+        a_stories = a.get("stories") or []
+        b_stories = b.get("stories") or []
+
+        if not a_name or not b_name:
+            self._send_json(400, {"error": "two countries (a, b) are required"})
+            return
+        if a_name == b_name:
+            self._send_json(400, {"error": "pick two different countries"})
+            return
+        if not a_stories or not b_stories:
+            self._send_json(400, {
+                "error": "both countries need fetched stories to compare",
+            })
+            return
+
+        try:
+            analysis = _compare_news(a_name, a_stories, b_name, b_stories)
+        except Exception as exc:  # noqa: BLE001 - surface to client as JSON
+            import traceback
+            traceback.print_exc(file=sys.stderr)
+            self._send_json(502, {"error": str(exc)})
+            return
+
+        self._send_json(200, {
+            "model": COMPARE_MODEL,
+            "a": a_name,
+            "b": b_name,
+            "analysis": analysis,
+        })
 
     def _handle_news(self, raw_query: str) -> None:
         params = urllib.parse.parse_qs(raw_query)
