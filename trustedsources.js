@@ -11,7 +11,20 @@ const trustedSources = {
     "Associated Press",
     "NPR",
     "PBS NewsHour",
-    "Wall Street Journal"
+    "Wall Street Journal",
+    "The New York Times",
+    "The Washington Post",
+    "USA Today",
+    "CNN",
+    "NBC News",
+    "CBS News",
+    "ABC News",
+    "Bloomberg",
+    "Politico",
+    "The Hill",
+    "Axios",
+    "Los Angeles Times",
+    "The Atlantic"
   ],
 
   IN: [
@@ -177,7 +190,20 @@ const trustedSourceDomains = {
     "apnews.com", "ap.org",
     "npr.org",
     "pbs.org",
-    "wsj.com"
+    "wsj.com",
+    "nytimes.com",
+    "washingtonpost.com",
+    "usatoday.com",
+    "cnn.com",
+    "nbcnews.com",
+    "cbsnews.com",
+    "abcnews.go.com",
+    "bloomberg.com",
+    "politico.com",
+    "thehill.com",
+    "axios.com",
+    "latimes.com",
+    "theatlantic.com"
   ],
 
   IN: [
