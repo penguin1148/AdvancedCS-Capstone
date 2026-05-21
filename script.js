@@ -256,12 +256,79 @@ function refreshCompareOptions() {
   }
 }
 
+// Escape HTML so model output can never inject markup; we add our own tags
+// afterward in renderMarkdown.
+function escapeHtml(s) {
+  return String(s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+// Inline formatting on already-escaped text: **bold** and *italic*.
+function renderInline(s) {
+  s = s.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+  s = s.replace(/(^|[^*])\*([^*]+)\*(?!\*)/g, "$1<em>$2</em>");
+  return s;
+}
+
+// Minimal markdown -> HTML for Claude's comparison output. Supports headings
+// (#..######), bullet lists, **bold**/*italic*, and ":::shared … :::" fenced
+// blocks which we render as a highlighted box for stories that connect both
+// countries.
+function renderMarkdown(md) {
+  if (!md) return "";
+  const lines = escapeHtml(md).split(/\r?\n/);
+  const out = [];
+  let inList = false;
+  let inShared = false;
+  const closeList = () => { if (inList) { out.push("</ul>"); inList = false; } };
+
+  for (const raw of lines) {
+    const line = raw.trim();
+
+    if (line === ":::shared" || line === ":::") {
+      closeList();
+      if (line === ":::shared" && !inShared) {
+        out.push('<div class="shared">');
+        inShared = true;
+      } else if (line === ":::" && inShared) {
+        out.push("</div>");
+        inShared = false;
+      }
+      continue;
+    }
+
+    if (!line) { closeList(); continue; }
+
+    const heading = line.match(/^#{1,6}\s+(.*)$/);
+    if (heading) {
+      closeList();
+      out.push("<h4>" + renderInline(heading[1]) + "</h4>");
+      continue;
+    }
+
+    const bullet = line.match(/^[-*]\s+(.*)$/);
+    if (bullet) {
+      if (!inList) { out.push("<ul>"); inList = true; }
+      out.push("<li>" + renderInline(bullet[1]) + "</li>");
+      continue;
+    }
+
+    closeList();
+    out.push("<p>" + renderInline(line) + "</p>");
+  }
+  closeList();
+  if (inShared) out.push("</div>");
+  return out.join("\n");
+}
+
 async function compareCountries() {
   const aName = document.getElementById("compareA").value;
   const bName = document.getElementById("compareB").value;
   const status = document.getElementById("compareStatus");
   const result = document.getElementById("compareResult");
-  result.textContent = "";
+  result.innerHTML = "";
 
   if (!aName || !bName) {
     status.textContent = "Pick two countries you've already loaded.";
@@ -288,7 +355,9 @@ async function compareCountries() {
       return;
     }
     status.textContent = `Comparison of ${aName} vs ${bName} (via ${data.model}):`;
-    result.textContent = data.analysis || "(no analysis returned)";
+    result.innerHTML = data.analysis
+      ? renderMarkdown(data.analysis)
+      : "<p>(no analysis returned)</p>";
   } catch (err) {
     status.textContent = `Compare request failed: ${err.message || err}`;
   }
