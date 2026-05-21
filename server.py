@@ -52,6 +52,13 @@ WEB_MAX_RETRIES = 3         # total attempts on 429 / network errors
 WEB_INITIAL_BACKOFF = 3.0   # first retry delay; doubles up to WEB_MAX_BACKOFF
 WEB_MAX_BACKOFF = 12.0      # cap any single backoff at this many seconds
 
+# GDELT rejects overly long queries ("Your query was too short or too long"),
+# so a large trusted-domain allowlist (e.g. the US list) is fetched as several
+# smaller `(domain:a OR domain:b ...)` queries, each kept under this many
+# characters. ~6 domains fit comfortably; this leaves margin below GDELT's
+# limit while keeping the number of chunks (and 5s-throttled requests) low.
+GDELT_QUERY_CHAR_BUDGET = 220
+
 VALID_SOURCES = {"gdelt", "freenewsapi"}
 
 # Cheap model for the country-comparison feature. Pulled from the env var
@@ -218,6 +225,29 @@ def _build_gdelt_query(country: str, domains: list[str] | None = None) -> str:
     return country
 
 
+def _chunk_domains(domains: list[str],
+                   char_budget: int = GDELT_QUERY_CHAR_BUDGET) -> list[list[str]]:
+    """Split ``domains`` into groups whose ``(domain:a OR domain:b ...)`` query
+    string stays under GDELT's length ceiling.
+
+    A big allowlist would otherwise produce a single query GDELT rejects as
+    "too long", so we fetch it as a few smaller queries and merge the results.
+    """
+    chunks: list[list[str]] = []
+    current: list[str] = []
+    for d in domains:
+        candidate = current + [d]
+        query = "(" + " OR ".join(f"domain:{x}" for x in candidate) + ")"
+        if current and len(query) > char_budget:
+            chunks.append(current)
+            current = [d]
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+    return chunks
+
+
 def _balance_by_domain(stories: list[dict], domains: list[str],
                        max_records: int) -> list[dict]:
     """Round-robin stories across the given trusted domains so the result is
@@ -288,23 +318,45 @@ def _fetch_gdelt(country: str, country_code: str, timespan: str,
     # round-robin publishers into a diverse result, even when the user has
     # not configured a trusted-domains allowlist.
     upstream_max = 250
-    print(f"[gdelt:{country}] fetching (timespan={timespan}, "
-          f"upstream_max={upstream_max}, return_max={max_records}, "
-          f"domains={domains or '-'})", file=sys.stderr, flush=True)
-    stories = gdelt_fetch_stories(
-        _build_gdelt_query(country, domains),
-        max_records=upstream_max,
-        timespan=timespan,
-        timeout=WEB_TIMEOUT,
-        max_retries=WEB_MAX_RETRIES,
-        initial_backoff=WEB_INITIAL_BACKOFF,
-        max_backoff=WEB_MAX_BACKOFF,
-        on_wait=_on_wait,
-    )
-    payload = [s.to_dict() for s in stories]
+
+    def _run(query: str) -> list[dict]:
+        stories = gdelt_fetch_stories(
+            query,
+            max_records=upstream_max,
+            timespan=timespan,
+            timeout=WEB_TIMEOUT,
+            max_retries=WEB_MAX_RETRIES,
+            initial_backoff=WEB_INITIAL_BACKOFF,
+            max_backoff=WEB_MAX_BACKOFF,
+            on_wait=_on_wait,
+        )
+        return [s.to_dict() for s in stories]
+
     if domains:
+        # Fetch the allowlist as length-bounded chunks (GDELT rejects a single
+        # over-long OR query) and merge, de-duplicating by URL, before
+        # balancing across every trusted domain.
+        chunks = _chunk_domains(domains)
+        print(f"[gdelt:{country}] fetching {len(domains)} trusted domains in "
+              f"{len(chunks)} chunk(s) (timespan={timespan}, "
+              f"return_max={max_records})", file=sys.stderr, flush=True)
+        payload: list[dict] = []
+        seen: set[str] = set()
+        for chunk in chunks:
+            for story in _run(_build_gdelt_query(country, chunk)):
+                url = story.get("url") or ""
+                if url and url in seen:
+                    continue
+                if url:
+                    seen.add(url)
+                payload.append(story)
         return _balance_by_domain(payload, domains, max_records)
-    return _balance_generically(payload, max_records)
+
+    print(f"[gdelt:{country}] fetching (timespan={timespan}, "
+          f"upstream_max={upstream_max}, return_max={max_records}, domains=-)",
+          file=sys.stderr, flush=True)
+    return _balance_generically(_run(_build_gdelt_query(country, None)),
+                                max_records)
 
 
 def _fetch_freenewsapi(country: str, country_code: str, timespan: str,
