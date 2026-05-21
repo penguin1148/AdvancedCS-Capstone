@@ -68,6 +68,36 @@ _UNHEALTHY_COOLDOWN = 15.0
 _unhealthy_until: dict[str, float] = {"gdelt": 0.0, "freenewsapi": 0.0}
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def _load_dotenv() -> None:
+    """Read KEY=VALUE pairs from a .env file next to server.py.
+
+    Only sets variables that aren't already in the environment, so an
+    explicit ``export ANTHROPIC_API_KEY=...`` in the shell always wins.
+    Silently skips lines that are blank or start with ``#``.
+    """
+    env_path = os.path.join(HERE, ".env")
+    try:
+        with open(env_path) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, val = line.partition("=")
+                key = key.strip()
+                val = val.strip().strip("\"'")
+                if key and key not in os.environ:
+                    os.environ[key] = val
+    except FileNotFoundError:
+        pass
+    except Exception as exc:  # noqa: BLE001
+        print(f"[.env] warning: could not read {env_path}: {exc}",
+              file=sys.stderr, flush=True)
+
+
+_load_dotenv()
+
 STATIC_FILES = {
     "/": ("better_overview.html", "text/html; charset=utf-8"),
     "/better_overview.html": ("better_overview.html", "text/html; charset=utf-8"),
